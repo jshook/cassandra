@@ -31,7 +31,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  * injections for narrating the IO and formats used in sstables.
  */
 @SuppressWarnings({ "resource", "IOResourceOpenedButNotSafelyClosed" })
-public class IODoc
+public class IOLog
 {
     private MappedByteBuffer mbb = getMappedBuffer();
     private Charset charset = Charset.forName("UTF-8");
