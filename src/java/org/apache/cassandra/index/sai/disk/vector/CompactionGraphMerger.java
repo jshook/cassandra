@@ -48,6 +48,8 @@ import org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVecto
 import org.apache.cassandra.index.sai.utils.LowPriorityThreadFactory;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
+
 import static java.util.stream.Collectors.toList;
 
 /**
@@ -74,6 +76,9 @@ import static java.util.stream.Collectors.toList;
 public class CompactionGraphMerger
 {
     private static final Logger logger = LoggerFactory.getLogger(CompactionGraphMerger.class);
+
+    /** Killswitch: set to false to fall back to the legacy graph-rebuild path without restarting. */
+    public static volatile boolean ENABLED = CassandraRelevantProperties.SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED.getBoolean();
 
     private static final ForkJoinPool compactionFjp = new ForkJoinPool(
             Runtime.getRuntime().availableProcessors(),

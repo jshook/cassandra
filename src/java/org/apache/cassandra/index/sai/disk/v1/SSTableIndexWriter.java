@@ -403,7 +403,8 @@ public class SSTableIndexWriter implements PerIndexWriter
             // (so the TERMS_DATA file is empty), at least 2 source segments, all with inline
             // vectors and PQ compression, and V5 format (ZERO_OR_ONE_TO_MANY postings support).
             var sourcesForMerge = segments.isEmpty() ? collectMergeSources() : null;
-            if (sourcesForMerge != null
+            if (CompactionGraphMerger.ENABLED
+                && sourcesForMerge != null
                 && sourcesForMerge.size() >= 2
                 && CompactionGraphMerger.sourcesHaveInlineVectors(sourcesForMerge)
                 && CompactionGraphMerger.sourcesUsePQ(sourcesForMerge)

@@ -474,6 +474,11 @@ public enum CassandraRelevantProperties
     // buffers are used. A buffer will be allocated per encoding thread. The size of each buffer is the size
     // of the encoded graph node at layer 0, which varies based on graph feature settings.
     SAI_ENCODE_AND_WRITE_VECTOR_GRAPH_IN_PARALLEL_USE_DIRECT_BUFFERS("cassandra.sai.vector.encode_and_write_graph_in_parallel.use_direct_buffers", "false"),
+    // When true, vector index compaction merges existing on-disk HNSW graphs via jvector's
+    // OnDiskGraphIndexCompactor rather than rebuilding from individual vectors. Requires all
+    // source segments to have inline vectors and PQ compression. Set to false to fall back to
+    // the legacy rebuild path without restarting (takes effect on the next compaction).
+    SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED("cassandra.sai.vector.graph_compaction_merge_enabled", "true"),
 
     /**
      * Whether to disable auto-compaction

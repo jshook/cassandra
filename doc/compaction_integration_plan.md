@@ -215,5 +215,48 @@ Fix: add a `startOffset` parameter to `OnDiskGraphIndexCompactor.compact()` (or
 use a temp file and copy with SAI header wrapping).
 
 ### Feature flag
-The merge path should be guarded by a `CassandraRelevantProperties` flag so
-it can be disabled in production until fully validated.
+**Implemented.** The merge path is guarded by a runtime-configurable flag.
+
+#### Property
+
+| Property | Default | Description |
+|----------|---------|-------------|
+| `cassandra.sai.vector.graph_compaction_merge_enabled` | `true` | When `false`, all vector index compactions fall back to the legacy graph-rebuild path. |
+
+#### Where it lives
+
+- **`CassandraRelevantProperties.SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED`** —
+  typed enum entry that owns the property name and default value.
+- **`CompactionGraphMerger.ENABLED`** — `public static volatile boolean` initialized
+  from the property at class-load time. Being `volatile` allows the flag to be
+  flipped without a JVM restart (e.g. via a JMX diagnostic endpoint or a test
+  helper that writes directly to the field).
+
+The flag is checked as the *first* condition in
+`SSTableIndexWriter.newSegmentBuilder()`, so a disabled flag short-circuits
+immediately without touching the index view or iterating over source segments.
+
+#### Disabling at startup
+
+Pass the JVM system property before the node starts:
+
+```
+-Dcassandra.sai.vector.graph_compaction_merge_enabled=false
+```
+
+#### Disabling at runtime (without restart)
+
+From any code path with access to the class (e.g. a JMX bean or a CNDB
+diagnostic tool):
+
+```java
+CompactionGraphMerger.ENABLED = false;
+```
+
+This takes effect on the **next** compaction that picks a segment builder; any
+compaction already in progress continues on whatever path it selected.
+
+#### Re-enabling
+
+Set the property back to `true` at startup, or set `CompactionGraphMerger.ENABLED = true`
+at runtime. The next eligible compaction will use the merge path again.
