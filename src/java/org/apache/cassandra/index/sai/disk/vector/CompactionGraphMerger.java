@@ -90,8 +90,27 @@ public class CompactionGraphMerger
      * One input segment for the merge. The {@link CassandraDiskAnn} provides the on-disk graph
      * (via {@link CassandraDiskAnn#getOnDiskGraph()}), PQ, and other metadata.
      */
-    public record SourceSegment(CassandraDiskAnn diskAnn, long segmentRowIdOffset)
+    public static final class SourceSegment
     {
+        private final CassandraDiskAnn diskAnn;
+        private final long segmentRowIdOffset;
+
+        public SourceSegment(CassandraDiskAnn diskAnn, long segmentRowIdOffset)
+        {
+            this.diskAnn = diskAnn;
+            this.segmentRowIdOffset = segmentRowIdOffset;
+        }
+
+        public CassandraDiskAnn diskAnn()
+        {
+            return diskAnn;
+        }
+
+        public long segmentRowIdOffset()
+        {
+            return segmentRowIdOffset;
+        }
+
         public OnDiskGraphIndex graph()
         {
             return diskAnn.getOnDiskGraph();
