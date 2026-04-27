@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import com.google.common.base.Preconditions;
@@ -31,6 +32,9 @@ import com.google.common.base.Stopwatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Set;
+
+import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -40,17 +44,21 @@ import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.v1.Segment;
 import org.apache.cassandra.index.sai.disk.v2.V2VectorIndexSearcher;
 import org.apache.cassandra.index.sai.disk.v3.V3OnDiskFormat;
+import org.apache.cassandra.index.sai.disk.v5.V5OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorIndexSearcher;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter;
 import org.apache.cassandra.index.sai.disk.vector.CassandraDiskAnn;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
+import org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger;
 import org.apache.cassandra.index.sai.disk.vector.VectorCompression.CompressionType;
 import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.storage.StorageProvider;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
@@ -71,6 +79,8 @@ public class SSTableIndexWriter implements PerIndexWriter
     private final BooleanSupplier isIndexDropped;
     private final BooleanSupplier isIndexUnloaded;
     private final long keyCount;
+    @Nullable
+    private final Set<SSTableReader> inputSSTables;
 
     private boolean aborted = false;
 
@@ -81,6 +91,13 @@ public class SSTableIndexWriter implements PerIndexWriter
     public SSTableIndexWriter(IndexComponents.ForWrite perIndexComponents, NamedMemoryLimiter limiter,
                               BooleanSupplier isIndexDropped, BooleanSupplier isIndexUnloaded, long keyCount)
     {
+        this(perIndexComponents, limiter, isIndexDropped, isIndexUnloaded, keyCount, null);
+    }
+
+    public SSTableIndexWriter(IndexComponents.ForWrite perIndexComponents, NamedMemoryLimiter limiter,
+                              BooleanSupplier isIndexDropped, BooleanSupplier isIndexUnloaded, long keyCount,
+                              @Nullable Set<SSTableReader> inputSSTables)
+    {
         this.perIndexComponents = perIndexComponents;
         this.indexContext = perIndexComponents.context();
         Preconditions.checkNotNull(indexContext, "Provided components %s are the per-sstable ones, expected per-index ones", perIndexComponents);
@@ -89,6 +106,7 @@ public class SSTableIndexWriter implements PerIndexWriter
         this.isIndexDropped = isIndexDropped;
         this.isIndexUnloaded = isIndexUnloaded;
         this.keyCount = keyCount;
+        this.inputSSTables = inputSSTables;
     }
 
     @Override
@@ -380,22 +398,41 @@ public class SSTableIndexWriter implements PerIndexWriter
 
         if (indexContext.isVector())
         {
-            // if we have a PQ instance available, we can use it to build a CompactionGraph;
-            // otherwise, build on heap (which will create PQ for next time, if we have enough vectors)
-            var pqi = CassandraOnHeapGraph.getPqIfPresent(indexContext, vc -> vc.type == CompressionType.PRODUCT_QUANTIZATION);
-            // If no PQ instance available in indexes of completed sstables, check if we just wrote one in the previous segment
-            if (pqi == null && !segments.isEmpty())
-                pqi = maybeReadPqFromLastSegment();
-
-            if (pqi != null && V3OnDiskFormat.ENABLE_LTM_CONSTRUCTION)
+            // --- Merge path: delegate graph construction to jvector's OnDiskGraphIndexCompactor ---
+            // Conditions: compaction operation (inputSSTables != null), no prior output segments
+            // (so the TERMS_DATA file is empty), at least 2 source segments, all with inline
+            // vectors and PQ compression, and V5 format (ZERO_OR_ONE_TO_MANY postings support).
+            var sourcesForMerge = segments.isEmpty() ? collectMergeSources() : null;
+            if (sourcesForMerge != null
+                && sourcesForMerge.size() >= 2
+                && CompactionGraphMerger.sourcesHaveInlineVectors(sourcesForMerge)
+                && CompactionGraphMerger.sourcesUsePQ(sourcesForMerge)
+                && V5OnDiskFormat.writeV5VectorPostings(indexContext.version()))
             {
-                var allRowsHaveVectors = allRowsHaveVectorsInWrittenSegments(indexContext);
-                builder = new SegmentBuilder.VectorOffHeapSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, pqi.pq, pqi.unitVectors, allRowsHaveVectors, limiter);
+                logger.debug("Using jvector graph merge path for {} source segments on {}",
+                             sourcesForMerge.size(), perIndexComponents.descriptor());
+                builder = new SegmentBuilder.VectorMergeSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, sourcesForMerge, limiter);
             }
+            // --- Existing paths ---
             else
             {
-                // building on heap is the only way to get a PQ from nothing (CompactionGraph only knows how to fine-tune an existing one)
-                builder = new SegmentBuilder.VectorOnHeapSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, limiter);
+                // if we have a PQ instance available, we can use it to build a CompactionGraph;
+                // otherwise, build on heap (which will create PQ for next time, if we have enough vectors)
+                var pqi = CassandraOnHeapGraph.getPqIfPresent(indexContext, vc -> vc.type == CompressionType.PRODUCT_QUANTIZATION);
+                // If no PQ instance available in indexes of completed sstables, check if we just wrote one in the previous segment
+                if (pqi == null && !segments.isEmpty())
+                    pqi = maybeReadPqFromLastSegment();
+
+                if (pqi != null && V3OnDiskFormat.ENABLE_LTM_CONSTRUCTION)
+                {
+                    var allRowsHaveVectors = allRowsHaveVectorsInWrittenSegments(indexContext);
+                    builder = new SegmentBuilder.VectorOffHeapSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, pqi.pq, pqi.unitVectors, allRowsHaveVectors, limiter);
+                }
+                else
+                {
+                    // building on heap is the only way to get a PQ from nothing (CompactionGraph only knows how to fine-tune an existing one)
+                    builder = new SegmentBuilder.VectorOnHeapSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, limiter);
+                }
             }
         }
         else if (indexContext.isLiteral())
@@ -431,6 +468,29 @@ public class SSTableIndexWriter implements PerIndexWriter
             }
         }
         return true;
+    }
+
+    @Nullable
+    private List<CompactionGraphMerger.SourceSegment> collectMergeSources()
+    {
+        if (inputSSTables == null || inputSSTables.isEmpty())
+            return null;
+
+        var result = new ArrayList<CompactionGraphMerger.SourceSegment>();
+        for (SSTableIndex ssTableIndex : indexContext.getView().getIndexes())
+        {
+            if (!inputSSTables.contains(ssTableIndex.getSSTable()))
+                continue;
+            for (Segment segment : ssTableIndex.getSegments())
+            {
+                var searcher = segment.getIndexSearcher();
+                if (!(searcher instanceof V2VectorIndexSearcher))
+                    continue;
+                var diskAnn = ((V2VectorIndexSearcher) searcher).graph;
+                result.add(new CompactionGraphMerger.SourceSegment(diskAnn, segment.metadata.segmentRowIdOffset));
+            }
+        }
+        return result.isEmpty() ? null : result;
     }
 
     private CassandraOnHeapGraph.PqInfo maybeReadPqFromLastSegment() throws IOException

@@ -182,6 +182,21 @@ public class CassandraDiskAnn
         return pq;
     }
 
+    public OnDiskGraphIndex getOnDiskGraph()
+    {
+        return (OnDiskGraphIndex) graph;
+    }
+
+    public OnDiskOrdinalsMap getOrdinalsMap()
+    {
+        return ordinalsMap;
+    }
+
+    public boolean isPqUnitVectors()
+    {
+        return pqUnitVectors;
+    }
+
     public long ramBytesUsed()
     {
         return graph.ramBytesUsed() + compressedVectorBytes();

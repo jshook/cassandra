@@ -33,6 +33,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableContext;
@@ -201,7 +202,10 @@ public class V1OnDiskFormat implements OnDiskFormat
             logger.debug(index.getIndexContext().logMessage("Starting a compaction index build. Global segment memory usage: {}"),
                          prettyPrintMemory(limiter.currentBytesUsed()));
 
-            return new SSTableIndexWriter(perIndexComponents, limiter, index.isDropped(), index.isUnloaded(), keyCount);
+            Set<SSTableReader> inputSSTables = tracker.opType() == OperationType.COMPACTION && tracker instanceof LifecycleTransaction
+                                               ? ((LifecycleTransaction) tracker).originals()
+                                               : null;
+            return new SSTableIndexWriter(perIndexComponents, limiter, index.isDropped(), index.isUnloaded(), keyCount, inputSSTables);
         }
 
         return new MemtableIndexWriter(context.getPendingMemtableIndex(tracker),

@@ -22,6 +22,7 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
+import java.util.ArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -362,6 +363,152 @@ public abstract class SegmentBuilder
             catch (IOException e)
             {
                 throw new UncheckedIOException(e);
+            }
+            return super.release(indexContext);
+        }
+    }
+
+    /**
+     * Segment builder for the jvector on-disk graph merge path. Instead of rebuilding the graph
+     * from individual vectors, it records each incoming vector and its output row ID into a
+     * ChronicleMap during the row-by-row pass, then delegates the actual graph construction to
+     * {@link org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger} at flush time.
+     *
+     * <p>This path is active when all input SSTables already have graph indexes and at least
+     * two source segments are available. The merger writes one output segment per compaction.
+     */
+    public static class VectorMergeSegmentBuilder extends SegmentBuilder
+    {
+        private final List<org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger.SourceSegment> sourceSegments;
+        private final org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger merger;
+        private final int dimension;
+        private final net.openhft.chronicle.map.ChronicleMap<io.github.jbellis.jvector.vector.types.VectorFloat<?>,
+                org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings> postingsMap;
+        private final org.apache.cassandra.io.util.File postingsMapFile;
+        private final org.apache.cassandra.db.marshal.VectorType.VectorSerializer serializer;
+        private int maxSegmentRowId = -1;
+
+        @SuppressWarnings("unchecked")
+        public VectorMergeSegmentBuilder(
+                IndexComponents.ForWrite components,
+                long rowIdOffset,
+                long estimatedRows,
+                List<org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger.SourceSegment> sourceSegments,
+                NamedMemoryLimiter limiter) throws java.io.IOException
+        {
+            super(components, rowIdOffset, limiter);
+            this.sourceSegments = sourceSegments;
+            this.dimension = sourceSegments.get(0).graph().getDimension();
+            this.serializer = (org.apache.cassandra.db.marshal.VectorType.VectorSerializer)
+                    components.context().getValidator().getSerializer();
+
+            this.merger = new org.apache.cassandra.index.sai.disk.vector.CompactionGraphMerger(
+                    sourceSegments,
+                    components.context().getIndexWriterConfig().getSimilarityFunction(),
+                    components);
+
+            postingsMapFile = components.tmpFileFor("merge_postings_chronicle_map");
+            int entries = (int) Math.min(Math.max(1000L, (long) (1.1 * estimatedRows)), (long) Integer.MAX_VALUE - 100_000);
+            postingsMap = (net.openhft.chronicle.map.ChronicleMap<io.github.jbellis.jvector.vector.types.VectorFloat<?>,
+                    org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings>)
+                    net.openhft.chronicle.map.ChronicleMapBuilder
+                            .of((Class<io.github.jbellis.jvector.vector.types.VectorFloat<?>>) (Class<?>) io.github.jbellis.jvector.vector.types.VectorFloat.class,
+                                (Class<org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings>) (Class<?>) org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings.class)
+                            .averageKeySize(dimension * Float.BYTES)
+                            .keySizeMarshaller(net.openhft.chronicle.hash.serialization.SizeMarshaller.constant((long) dimension * Float.BYTES))
+                            .averageValueSize(org.apache.cassandra.index.sai.disk.vector.VectorPostings.emptyBytesUsed()
+                                             + io.github.jbellis.jvector.util.RamUsageEstimator.NUM_BYTES_OBJECT_REF
+                                             + 2 * Integer.BYTES)
+                            .keyMarshaller(new org.apache.cassandra.index.sai.disk.vector.CompactionGraph.VectorFloatMarshaller(dimension))
+                            .valueMarshaller(new org.apache.cassandra.index.sai.disk.vector.VectorPostings.Marshaller())
+                            .entries(entries)
+                            .createPersistedTo(postingsMapFile.toJavaIOFile());
+
+            totalBytesAllocated = 0;
+            totalBytesAllocatedConcurrent.add(0);
+        }
+
+        @Override
+        public boolean isEmpty()
+        {
+            return postingsMap.isEmpty();
+        }
+
+        @Override
+        protected long addInternal(List<ByteBuffer> terms, int segmentRowId)
+        {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        protected long addInternalAsync(List<ByteBuffer> terms, int segmentRowId)
+        {
+            assert terms.size() == 1;
+            var vectorBuf = terms.get(0);
+            if (vectorBuf == null || vectorBuf.remaining() == 0)
+                return 0;
+
+            io.github.jbellis.jvector.vector.VectorizationProvider vtsLocal =
+                    io.github.jbellis.jvector.vector.VectorizationProvider.getInstance();
+            io.github.jbellis.jvector.vector.types.VectorFloat<?> vector =
+                    vtsLocal.getVectorTypeSupport().createFloatVector(serializer.deserializeFloatArray(vectorBuf));
+
+            maxSegmentRowId = Math.max(maxSegmentRowId, segmentRowId);
+
+            try (var ctx = postingsMap.queryContext(vector))
+            {
+                //noinspection LockAcquiredButNotSafelyReleased
+                ctx.writeLock().lock();
+                var absent = ctx.absentEntry();
+                if (absent != null)
+                {
+                    var cvp = new org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings(0, segmentRowId);
+                    absent.doInsert(ctx.wrapValueAsData(cvp));
+                }
+                else
+                {
+                    var entry = ctx.entry();
+                    assert entry != null;
+                    var cvp = entry.value().get();
+                    cvp.add(segmentRowId);
+                    entry.doReplaceValue(ctx.wrapValueAsData(cvp));
+                }
+            }
+            return 0;
+        }
+
+        @Override
+        protected void flushInternal(SegmentMetadataBuilder metadataBuilder) throws java.io.IOException
+        {
+            if (postingsMap.isEmpty())
+                return;
+            var componentsMetadata = merger.merge(postingsMap, maxSegmentRowId);
+            metadataBuilder.setComponentsMetadata(componentsMetadata);
+        }
+
+        @Override
+        public boolean supportsAsyncAdd()
+        {
+            return true;
+        }
+
+        @Override
+        public boolean requiresFlush()
+        {
+            return false;
+        }
+
+        @Override
+        long release(IndexContext indexContext)
+        {
+            try
+            {
+                postingsMap.close();
+                org.apache.cassandra.io.util.FileUtils.deleteWithConfirm(postingsMapFile);
+            }
+            catch (Exception e)
+            {
+                throw new java.io.UncheckedIOException(new java.io.IOException("Error closing merge postings map", e));
             }
             return super.release(indexContext);
         }

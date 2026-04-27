@@ -276,8 +276,11 @@ public class V5VectorPostingsWriter<T>
             }
             else
             {
-                var rowIds = postingsMap.get(vectorValues.getVector(originalOrdinal)).getRowIds();
-                postingListSize = rowIds.size();
+                var posting = postingsMap.get(vectorValues.getVector(originalOrdinal));
+                // A null posting means the source graph node has no surviving rows in the output
+                // (e.g. all rows for that vector were deleted). Treat it as an empty posting list:
+                // the node exists in the graph for connectivity but is invisible to queries.
+                postingListSize = posting == null ? 0 : posting.getRowIds().size();
             }
             nextOffset += 4 + (postingListSize * 4L); // 4 bytes for size and 4 bytes for each integer in the list
         }
@@ -292,7 +295,13 @@ public class V5VectorPostingsWriter<T>
                 writer.writeInt(0);
                 continue;
             }
-            var rowIds = postingsMap.get(vectorValues.getVector(originalOrdinal)).getRowIds();
+            var posting = postingsMap.get(vectorValues.getVector(originalOrdinal));
+            if (posting == null)
+            {
+                writer.writeInt(0);
+                continue;
+            }
+            var rowIds = posting.getRowIds();
             writer.writeInt(rowIds.size());
             for (int r = 0; r < rowIds.size(); r++)
                 writer.writeInt(rowIds.getInt(r));
@@ -314,7 +323,10 @@ public class V5VectorPostingsWriter<T>
             if (ord == OrdinalMapper.OMITTED)
                 continue;
 
-            var rowIds = postingsMap.get(vectorValues.getVector(ord)).getRowIds();
+            var posting = postingsMap.get(vectorValues.getVector(ord));
+            if (posting == null)
+                continue; // dead node: no rows in output, skip
+            var rowIds = posting.getRowIds();
             for (int r = 0; r < rowIds.size(); r++)
             {
                 var rowId = rowIds.getInt(r);
