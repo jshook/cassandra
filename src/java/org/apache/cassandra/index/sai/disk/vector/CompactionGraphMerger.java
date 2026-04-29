@@ -181,8 +181,8 @@ public class CompactionGraphMerger
             int maxSegmentRowId) throws IOException
     {
         // --- Step 1: Build all-live FixedBitSets and sequential OffsetMappers ---
-        var liveNodes = new ArrayList<FixedBitSet>(sources.size());
-        var remappers = new ArrayList<OrdinalMapper>(sources.size());
+        var liveNodes = new ArrayList<FixedBitSet>(sources.size() - 1);
+        var remappers = new ArrayList<OrdinalMapper>(sources.size() - 1);
         int offset = 0;
         for (var src : sources)
         {
