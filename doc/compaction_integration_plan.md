@@ -208,11 +208,13 @@ Requires an API on `OnDiskGraphIndexCompactor` to expose the retrained
 `ProductQuantization` after `compact()` returns.
 
 ### SAI codec header/footer for TERMS_DATA
-The merge path writes the raw jvector graph at `termsOffset=0` with no SAI
-codec header or footer. SAI checksum validation (`SAICodecUtils.checkFooter()`)
-will fail for this component during scrubbing. Normal querying is unaffected.
-Fix: add a `startOffset` parameter to `OnDiskGraphIndexCompactor.compact()` (or
-use a temp file and copy with SAI header wrapping).
+**Implemented.** The merge path now writes the raw jvector graph to a sibling
+temp file first, then copies those bytes through an `IndexOutputWriter` so the
+SAI CRC accumulates correctly. `SAICodecUtils.writeHeader()` and
+`SAICodecUtils.writeFooter()` wrap the raw graph bytes. `termsOffset` is set to
+`SAICodecUtils.headerSize()` (7 bytes) and `termsLength` is the raw graph size,
+matching the metadata conventions of the legacy flush path. Scrub validation
+will now pass for this component.
 
 ### Feature flag
 **Implemented.** The merge path is guarded by a runtime-configurable flag.

@@ -19,6 +19,9 @@
 package org.apache.cassandra.index.sai.disk.vector;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -66,9 +69,8 @@ import static java.util.stream.Collectors.toList;
  * <ul>
  *   <li>The PQ codebook written to the Cassandra PQ file is taken from the first source segment
  *       rather than the retrained codebook from the compactor. This is correct but sub-optimal.
- *   <li>The TERMS_DATA output file is written at offset 0 (no SAI codec header/footer) so that
- *       the compactor can write directly. SAI checksum validation will fail for this component
- *       during scrubbing; normal querying is unaffected.
+ *       Fixing this requires an API addition to {@code OnDiskGraphIndexCompactor} in jvector to
+ *       expose the retrained codebook after {@code compact()} returns.
  * </ul>
  */
 public class CompactionGraphMerger
@@ -83,6 +85,9 @@ public class CompactionGraphMerger
             new LowPriorityThreadFactory(),
             null,
             false);
+
+    /** Copy buffer size when streaming the raw graph into the SAI-wrapped TERMS_DATA file. */
+    private static final int COPY_BUFFER_SIZE = 1 << 20; // 1 MiB
 
     /**
      * One input segment for the merge. The {@link CassandraDiskAnn} provides the on-disk graph
@@ -174,6 +179,11 @@ public class CompactionGraphMerger
      * appears as a key in {@code postingsMap} (meaning at least one of its rows survived
      * compaction). Nodes from deleted rows are excluded from both the merged graph and the postings.
      *
+     * <p>The TERMS_DATA component is written with a proper SAI codec header and footer: the
+     * compacted jvector graph is first written to a temp file, then streamed through an
+     * {@link org.apache.cassandra.index.sai.disk.io.IndexOutputWriter} so the CRC accumulates
+     * over all bytes, producing a footer that survives SAI scrub validation.
+     *
      * @param postingsMap     vector → output postings map built during the row-by-row compaction pass
      * @param maxSegmentRowId the largest segment-local row ID in the compaction output
      * @return component metadata describing the written segment
@@ -183,8 +193,8 @@ public class CompactionGraphMerger
             int maxSegmentRowId) throws IOException
     {
         // --- Step 1: Open graph views and build per-source live bitsets + ordinal mappings ---
-        // Views are opened here so that vector reads can be used for dead-node detection:
-        // a node is "live" for the output only if its vector appears in postingsMap.
+        // Views are opened here (not later) so that vector reads can be used for dead-node
+        // detection: a node is "live" for the output only if its vector appears in postingsMap.
         var views = new ArrayList<OnDiskGraphIndex.View>(sources.size());
         var liveNodes = new ArrayList<FixedBitSet>(sources.size());
         var remappers = new ArrayList<OrdinalMapper>(sources.size());
@@ -229,37 +239,66 @@ public class CompactionGraphMerger
         int[] globalToSrcIdx = globalSrcIdxList.stream().mapToInt(Integer::intValue).toArray();
         int[] globalToNodeId = globalNodeIdList.stream().mapToInt(Integer::intValue).toArray();
 
-        // --- Step 2: Run the jvector compactor ---
-        // Write directly to the TERMS_DATA file at offset 0 (no SAI codec header; see class-level
-        // note). termsOffset is therefore 0.
-        var termsFile = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA).file();
-        var outputPath = termsFile.toJavaIOFile().toPath();
-
-        logger.info("CompactionGraphMerger: merging {} source segments ({} surviving ordinals) into {}",
-                    sources.size(), totalGlobalOrdinals, outputPath);
-
-        var compactor = new OnDiskGraphIndexCompactor(
-                sources.stream().map(SourceSegment::graph).collect(toList()),
-                liveNodes,
-                remappers,
-                similarityFunction,
-                compactionFjp);
-
-        try
+        try  // outer try: closes source graph views
         {
-            compactor.compact(outputPath);
+            // --- Step 2: Run the jvector compactor to a temp file, then wrap with SAI header/footer ---
+            // The compactor writes raw jvector format starting at byte 0 and has no awareness of
+            // SAI framing. We write to a sibling temp file, then copy through an IndexOutputWriter
+            // so the CRC accumulates correctly over header + graph data, allowing writeFooter() to
+            // produce a valid SAI checksum that survives scrub validation.
+            var termsComponent = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA);
+            Path termsParentDir = termsComponent.file().toJavaIOFile().toPath().getParent();
+            Path tempGraphPath = Files.createTempFile(termsParentDir, "jvec_compact_", ".tmp");
 
-            long termsOffset = 0;
-            long termsLength = termsFile.length();
-            logger.info("CompactionGraphMerger: compacted graph written ({} bytes)", termsLength);
+            long termsOffset;
+            long termsLength;
 
+            try
+            {
+                var compactor = new OnDiskGraphIndexCompactor(
+                        sources.stream().map(SourceSegment::graph).collect(toList()),
+                        liveNodes,
+                        remappers,
+                        similarityFunction,
+                        compactionFjp);
+                compactor.compact(tempGraphPath);
+                termsLength = Files.size(tempGraphPath);
+
+                logger.info("CompactionGraphMerger: merging {} source segments ({} surviving ordinals), raw graph {} bytes",
+                            sources.size(), totalGlobalOrdinals, termsLength);
+
+                try (var termsOutput = termsComponent.openOutput(true))
+                {
+                    SAICodecUtils.writeHeader(termsOutput);
+                    termsOffset = termsOutput.getFilePointer(); // = SAICodecUtils.headerSize()
+
+                    byte[] copyBuf = new byte[COPY_BUFFER_SIZE];
+                    try (InputStream rawIn = Files.newInputStream(tempGraphPath))
+                    {
+                        int bytesRead;
+                        while ((bytesRead = rawIn.read(copyBuf)) != -1)
+                            termsOutput.writeBytes(copyBuf, 0, bytesRead);
+                    }
+
+                    SAICodecUtils.writeFooter(termsOutput);
+                }
+                logger.info("CompactionGraphMerger: TERMS_DATA written with SAI header/footer ({} bytes raw graph at offset {})",
+                            termsLength, termsOffset);
+            }
+            finally
+            {
+                Files.deleteIfExists(tempGraphPath);
+            }
+
+            // --- Step 3: Write postings and PQ ---
             try (var postingsOutput = perIndexComponents.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true);
                  var pqOutput = perIndexComponents.addOrGet(IndexComponentType.PQ).openOutput(true))
             {
                 SAICodecUtils.writeHeader(postingsOutput);
                 SAICodecUtils.writeHeader(pqOutput);
 
-                // --- Step 3: Write PQ from the first source (pre-compaction codebook) ---
+                // Write PQ from the first source (pre-compaction codebook).
+                // A follow-up will expose the retrained codebook from the compactor.
                 var firstDiskAnn = sources.get(0).diskAnn();
                 long pqOffset = pqOutput.getFilePointer();
                 var version = perIndexComponents.context().version();
@@ -271,10 +310,10 @@ public class CompactionGraphMerger
                 pq.write(pqOutput.asSequentialWriter(), version.onDiskFormat().jvectorFileFormatVersion());
                 long pqLength = pqOutput.getFilePointer() - pqOffset;
 
-                // --- Step 4: Write postings using ZERO_OR_ONE_TO_MANY ---
+                // Write postings using ZERO_OR_ONE_TO_MANY.
                 // MergedSourceVectorValues maps each output global ordinal directly to its source
-                // and local node ID using the arrays built in Step 1. Ordinals for nodes with no
-                // surviving rows were excluded in Step 1, so every ordinal here has postings.
+                // and local node ID. Every ordinal here has postings (dead nodes were excluded in
+                // Step 1), so the null-postings path in V5VectorPostingsWriter is not exercised.
                 long postingsOffset = postingsOutput.getFilePointer();
                 var ordinalMapper = new OrdinalMapper.IdentityMapper(totalGlobalOrdinals - 1);
                 var rp = new RemappedPostings(Structure.ZERO_OR_ONE_TO_MANY,
@@ -321,7 +360,7 @@ public class CompactionGraphMerger
      * {@code size(0)}, so the bitset must be sized to {@code idUpperBound} and populated by
      * iterating the actual live-node IDs returned by {@link OnDiskGraphIndex#getNodes(int)}.
      *
-     * <p>Used by tests to verify the tombstone-gap fix in isolation. Production code calls
+     * <p>Used by tests to verify the tombstone-gap fix in isolation. Production code uses
      * {@link #buildLiveBitset(OnDiskGraphIndex, OnDiskGraphIndex.View, Map)} instead.
      */
     static FixedBitSet buildLiveBitset(OnDiskGraphIndex graph)
