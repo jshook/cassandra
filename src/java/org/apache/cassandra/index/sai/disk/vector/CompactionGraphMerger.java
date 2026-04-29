@@ -19,9 +19,10 @@
 package org.apache.cassandra.index.sai.disk.vector;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ForkJoinPool;
 
 import org.slf4j.Logger;
@@ -61,11 +62,8 @@ import static java.util.stream.Collectors.toList;
  * <p>Each source is represented by a {@link SourceSegment} containing the on-disk graph and its
  * associated {@link CassandraDiskAnn} (for PQ, unit-vectors flag, and the ordinals map).
  *
- * <p><b>MVP limitations:</b>
+ * <p><b>Known limitations:</b>
  * <ul>
- *   <li>All source nodes are treated as live (FixedBitSet all-true). Dead nodes from deleted rows
- *       have no postings in the output and are invisible to queries, but do consume graph space.
- *       Accurate dead-node tracking is a follow-up.
  *   <li>The PQ codebook written to the Cassandra PQ file is taken from the first source segment
  *       rather than the retrained codebook from the compactor. This is correct but sub-optimal.
  *   <li>The TERMS_DATA output file is written at offset 0 (no SAI codec header/footer) so that
@@ -172,6 +170,10 @@ public class CompactionGraphMerger
     /**
      * Merges the source graphs and writes all SAI index components for the output segment.
      *
+     * <p>Dead-node detection: a source graph node is included in the output only if its vector
+     * appears as a key in {@code postingsMap} (meaning at least one of its rows survived
+     * compaction). Nodes from deleted rows are excluded from both the merged graph and the postings.
+     *
      * @param postingsMap     vector → output postings map built during the row-by-row compaction pass
      * @param maxSegmentRowId the largest segment-local row ID in the compaction output
      * @return component metadata describing the written segment
@@ -180,38 +182,60 @@ public class CompactionGraphMerger
             ChronicleMap<VectorFloat<?>, CompactionVectorPostings> postingsMap,
             int maxSegmentRowId) throws IOException
     {
-        // --- Step 1: Build all-live FixedBitSets and sequential OffsetMappers ---
+        // --- Step 1: Open graph views and build per-source live bitsets + ordinal mappings ---
+        // Views are opened here so that vector reads can be used for dead-node detection:
+        // a node is "live" for the output only if its vector appears in postingsMap.
+        var views = new ArrayList<OnDiskGraphIndex.View>(sources.size());
         var liveNodes = new ArrayList<FixedBitSet>(sources.size());
         var remappers = new ArrayList<OrdinalMapper>(sources.size());
-        int offset = 0;
-        for (var src : sources)
+
+        // Parallel arrays: output global ordinal g → source index and local node ID.
+        var globalSrcIdxList = new ArrayList<Integer>();
+        var globalNodeIdList = new ArrayList<Integer>();
+
+        for (int s = 0; s < sources.size(); s++)
         {
-            int liveCount = src.graph().size(0);
+            var src = sources.get(s);
+            var view = src.graph().getView();
+            views.add(view);
+
             int idBound = src.graph().getIdUpperBound();
             var bs = new FixedBitSet(idBound);
-            if (idBound == liveCount)
+            var oldToNew = new HashMap<Integer, Integer>();
+
+            var nodeIt = src.graph().getNodes(0);
+            while (nodeIt.hasNext())
             {
-                bs.set(0, liveCount);
+                int nid = nodeIt.nextInt();
+                VectorFloat<?> vec = view.getVector(nid);
+                if (postingsMap.containsKey(vec))
+                {
+                    int globalOrdinal = globalSrcIdxList.size();
+                    bs.set(nid);
+                    oldToNew.put(nid, globalOrdinal);
+                    globalSrcIdxList.add(s);
+                    globalNodeIdList.add(nid);
+                }
             }
-            else
-            {
-                // Segment has tombstoned slots (idBound > liveCount); only mark actual live nodes.
-                var nodeIt = src.graph().getNodes(0);
-                while (nodeIt.hasNext()) bs.set(nodeIt.nextInt());
-            }
+
             liveNodes.add(bs);
-            remappers.add(new OrdinalMapper.OffsetMapper(offset, liveCount));
-            offset += liveCount;
+            remappers.add(new OrdinalMapper.MapMapper(oldToNew));
         }
-        int totalGlobalOrdinals = offset;
+
+        int totalGlobalOrdinals = globalSrcIdxList.size();
+        if (totalGlobalOrdinals == 0)
+            throw new IllegalStateException("CompactionGraphMerger: no surviving nodes found across all source segments; all rows may have been deleted");
+
+        int[] globalToSrcIdx = globalSrcIdxList.stream().mapToInt(Integer::intValue).toArray();
+        int[] globalToNodeId = globalNodeIdList.stream().mapToInt(Integer::intValue).toArray();
 
         // --- Step 2: Run the jvector compactor ---
         // Write directly to the TERMS_DATA file at offset 0 (no SAI codec header; see class-level
-        // MVP note). termsOffset is therefore 0.
+        // note). termsOffset is therefore 0.
         var termsFile = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA).file();
         var outputPath = termsFile.toJavaIOFile().toPath();
 
-        logger.info("CompactionGraphMerger: merging {} source segments ({} total ordinals) into {}",
+        logger.info("CompactionGraphMerger: merging {} source segments ({} surviving ordinals) into {}",
                     sources.size(), totalGlobalOrdinals, outputPath);
 
         var compactor = new OnDiskGraphIndexCompactor(
@@ -220,62 +244,62 @@ public class CompactionGraphMerger
                 remappers,
                 similarityFunction,
                 compactionFjp);
-        compactor.compact(outputPath);
 
-        long termsOffset = 0;
-        long termsLength = termsFile.length();
-        logger.info("CompactionGraphMerger: compacted graph written ({} bytes)", termsLength);
-
-        // --- Step 3: Open views for vector lookups during postings write ---
-        var views = new ArrayList<OnDiskGraphIndex.View>(sources.size());
-        for (var src : sources)
-            views.add(src.graph().getView());
-
-        try (var postingsOutput = perIndexComponents.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true);
-             var pqOutput = perIndexComponents.addOrGet(IndexComponentType.PQ).openOutput(true))
+        try
         {
-            SAICodecUtils.writeHeader(postingsOutput);
-            SAICodecUtils.writeHeader(pqOutput);
+            compactor.compact(outputPath);
 
-            // --- Step 4: Write PQ from the first source (pre-compaction codebook) ---
-            var firstDiskAnn = sources.get(0).diskAnn();
-            long pqOffset = pqOutput.getFilePointer();
-            var version = perIndexComponents.context().version();
-            CassandraOnHeapGraph.writePqHeader(pqOutput.asSequentialWriter(),
-                                               firstDiskAnn.isPqUnitVectors(),
-                                               VectorCompression.CompressionType.PRODUCT_QUANTIZATION,
-                                               version);
-            ProductQuantization pq = firstDiskAnn.getPQ();
-            pq.write(pqOutput.asSequentialWriter(), version.onDiskFormat().jvectorFileFormatVersion());
-            long pqLength = pqOutput.getFilePointer() - pqOffset;
+            long termsOffset = 0;
+            long termsLength = termsFile.length();
+            logger.info("CompactionGraphMerger: compacted graph written ({} bytes)", termsLength);
 
-            // --- Step 5: Write postings using ZERO_OR_ONE_TO_MANY with identity mapper ---
-            // For each global ordinal i, MergedSourceVectorValues reads the vector from the
-            // appropriate source graph; postingsMap lookup returns the output row IDs.
-            long postingsOffset = postingsOutput.getFilePointer();
-            var ordinalMapper = new OrdinalMapper.IdentityMapper(totalGlobalOrdinals - 1);
-            var rp = new RemappedPostings(Structure.ZERO_OR_ONE_TO_MANY,
-                                          totalGlobalOrdinals - 1,
-                                          maxSegmentRowId,
-                                          null, null,
-                                          ordinalMapper);
-
-            var vectorValues = new MergedSourceVectorValues(sources, views);
-            if (V5OnDiskFormat.writeV5VectorPostings(version))
+            try (var postingsOutput = perIndexComponents.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true);
+                 var pqOutput = perIndexComponents.addOrGet(IndexComponentType.PQ).openOutput(true))
             {
-                new V5VectorPostingsWriter<Integer>(rp)
-                        .writePostings(postingsOutput.asSequentialWriter(), vectorValues, postingsMap);
+                SAICodecUtils.writeHeader(postingsOutput);
+                SAICodecUtils.writeHeader(pqOutput);
+
+                // --- Step 3: Write PQ from the first source (pre-compaction codebook) ---
+                var firstDiskAnn = sources.get(0).diskAnn();
+                long pqOffset = pqOutput.getFilePointer();
+                var version = perIndexComponents.context().version();
+                CassandraOnHeapGraph.writePqHeader(pqOutput.asSequentialWriter(),
+                                                   firstDiskAnn.isPqUnitVectors(),
+                                                   VectorCompression.CompressionType.PRODUCT_QUANTIZATION,
+                                                   version);
+                ProductQuantization pq = firstDiskAnn.getPQ();
+                pq.write(pqOutput.asSequentialWriter(), version.onDiskFormat().jvectorFileFormatVersion());
+                long pqLength = pqOutput.getFilePointer() - pqOffset;
+
+                // --- Step 4: Write postings using ZERO_OR_ONE_TO_MANY ---
+                // MergedSourceVectorValues maps each output global ordinal directly to its source
+                // and local node ID using the arrays built in Step 1. Ordinals for nodes with no
+                // surviving rows were excluded in Step 1, so every ordinal here has postings.
+                long postingsOffset = postingsOutput.getFilePointer();
+                var ordinalMapper = new OrdinalMapper.IdentityMapper(totalGlobalOrdinals - 1);
+                var rp = new RemappedPostings(Structure.ZERO_OR_ONE_TO_MANY,
+                                              totalGlobalOrdinals - 1,
+                                              maxSegmentRowId,
+                                              null, null,
+                                              ordinalMapper);
+
+                var vectorValues = new MergedSourceVectorValues(globalToSrcIdx, globalToNodeId, dimension, views);
+                if (V5OnDiskFormat.writeV5VectorPostings(version))
+                {
+                    new V5VectorPostingsWriter<Integer>(rp)
+                            .writePostings(postingsOutput.asSequentialWriter(), vectorValues, postingsMap);
+                }
+                // else: V2 format doesn't support ZERO_OR_ONE_TO_MANY — fall back is handled at
+                // the builder-selection level (merge path is only used for V5+)
+                long postingsLength = postingsOutput.getFilePointer() - postingsOffset;
+
+                SAICodecUtils.writeFooter(pqOutput);
+                SAICodecUtils.writeFooter(postingsOutput);
+
+                return CassandraOnHeapGraph.createMetadataMap(termsOffset, termsLength,
+                                                              postingsOffset, postingsLength,
+                                                              pqOffset, pqLength);
             }
-            // else: V2 format doesn't support ZERO_OR_ONE_TO_MANY — fall back is handled at
-            // the builder-selection level (merge path is only used for V5+)
-            long postingsLength = postingsOutput.getFilePointer() - postingsOffset;
-
-            SAICodecUtils.writeFooter(pqOutput);
-            SAICodecUtils.writeFooter(postingsOutput);
-
-            return CassandraOnHeapGraph.createMetadataMap(termsOffset, termsLength,
-                                                          postingsOffset, postingsLength,
-                                                          pqOffset, pqLength);
         }
         finally
         {
@@ -288,39 +312,107 @@ public class CompactionGraphMerger
     }
 
     /**
-     * A {@link RandomAccessVectorValues} backed by the merged source graphs. Ordinal {@code i}
-     * maps to the source graph whose offset range covers {@code i}; the vector is read from that
-     * source at the corresponding local ordinal.
+     * Builds a {@link FixedBitSet} marking all jvector-live nodes in {@code graph} (i.e. all
+     * non-tombstoned slots), without consulting the postings map.
+     *
+     * <p>When the on-disk graph has no tombstoned slots ({@code idUpperBound == size(0)}), all
+     * node IDs fall in [0, liveCount) and a simple bulk-set suffices.  When tombstoned slots
+     * exist ({@code idUpperBound > size(0)}), some stored node IDs equal or exceed
+     * {@code size(0)}, so the bitset must be sized to {@code idUpperBound} and populated by
+     * iterating the actual live-node IDs returned by {@link OnDiskGraphIndex#getNodes(int)}.
+     *
+     * <p>Used by tests to verify the tombstone-gap fix in isolation. Production code calls
+     * {@link #buildLiveBitset(OnDiskGraphIndex, OnDiskGraphIndex.View, Map)} instead.
+     */
+    static FixedBitSet buildLiveBitset(OnDiskGraphIndex graph)
+    {
+        int liveCount = graph.size(0);
+        int idBound = graph.getIdUpperBound();
+        var bs = new FixedBitSet(idBound);
+        if (idBound == liveCount)
+        {
+            bs.set(0, liveCount);
+        }
+        else
+        {
+            var nodeIt = graph.getNodes(0);
+            while (nodeIt.hasNext()) bs.set(nodeIt.nextInt());
+        }
+        return bs;
+    }
+
+    /**
+     * Builds a {@link FixedBitSet} marking nodes that are both jvector-live (non-tombstoned) and
+     * Cassandra-alive (their vector appears as a key in {@code postingsMap}).
+     *
+     * <p>The bitset is sized to {@code idUpperBound} so that neighbor-ID lookups inside the
+     * compactor never exceed the bitset bounds.
+     */
+    static FixedBitSet buildLiveBitset(OnDiskGraphIndex graph,
+                                        OnDiskGraphIndex.View view,
+                                        Map<VectorFloat<?>, ?> postingsMap)
+    {
+        int idBound = graph.getIdUpperBound();
+        var bs = new FixedBitSet(idBound);
+        var nodeIt = graph.getNodes(0);
+        while (nodeIt.hasNext())
+        {
+            int nid = nodeIt.nextInt();
+            VectorFloat<?> vec = view.getVector(nid);
+            if (postingsMap.containsKey(vec))
+                bs.set(nid);
+        }
+        return bs;
+    }
+
+    /**
+     * A {@link RandomAccessVectorValues} backed by the merged source graphs. Each output global
+     * ordinal {@code g} maps directly to a (source, localNodeId) pair via parallel arrays built
+     * during dead-node detection, so lookup is O(1) with no binary search.
      *
      * <p>Not thread-safe: each source {@link OnDiskGraphIndex.View} has a single reader.
      */
-    private static class MergedSourceVectorValues implements RandomAccessVectorValues
+    static class MergedSourceVectorValues implements RandomAccessVectorValues
     {
-        private final List<SourceSegment> sources;
         private final List<OnDiskGraphIndex.View> views;
-        private final int[] globalOffsets;
-        private final int totalSize;
+        private final int[] globalToSrcIdx;
+        private final int[] globalToNodeId;
         private final int dimension;
 
-        MergedSourceVectorValues(List<SourceSegment> sources, List<OnDiskGraphIndex.View> views)
+        /**
+         * Production constructor: caller supplies the parallel arrays built during Step 1 of
+         * {@link CompactionGraphMerger#merge}.
+         */
+        MergedSourceVectorValues(int[] globalToSrcIdx, int[] globalToNodeId,
+                                  int dimension, List<OnDiskGraphIndex.View> views)
         {
-            this.sources = sources;
             this.views = views;
-            this.globalOffsets = new int[sources.size()];
-            int off = 0;
-            for (int i = 0; i < sources.size(); i++)
-            {
-                globalOffsets[i] = off;
-                off += sources.get(i).graph().size(0);
-            }
-            this.totalSize = off;
-            this.dimension = sources.get(0).graph().getDimension();
+            this.globalToSrcIdx = globalToSrcIdx;
+            this.globalToNodeId = globalToNodeId;
+            this.dimension = dimension;
+        }
+
+        /**
+         * Test-friendly constructor: builds sequential (no-dead-node) mappings from per-source
+         * sizes. Source {@code s} occupies global ordinals [offset_s, offset_s + sizes[s]).
+         */
+        MergedSourceVectorValues(int[] sizes, int dimension, List<OnDiskGraphIndex.View> views)
+        {
+            this.views = views;
+            this.dimension = dimension;
+            int total = 0;
+            for (int n : sizes) total += n;
+            this.globalToSrcIdx = new int[total];
+            this.globalToNodeId = new int[total];
+            int g = 0;
+            for (int s = 0; s < sizes.length; s++)
+                for (int n = 0; n < sizes[s]; n++) { globalToSrcIdx[g] = s; globalToNodeId[g] = n; g++; }
         }
 
         @Override
         public int size()
         {
-            return totalSize;
+            return globalToSrcIdx.length;
         }
 
         @Override
@@ -332,15 +424,13 @@ public class CompactionGraphMerger
         @Override
         public VectorFloat<?> getVector(int globalOrdinal)
         {
-            int s = findSource(globalOrdinal);
-            return views.get(s).getVector(globalOrdinal - globalOffsets[s]);
+            return views.get(globalToSrcIdx[globalOrdinal]).getVector(globalToNodeId[globalOrdinal]);
         }
 
         @Override
         public void getVectorInto(int globalOrdinal, VectorFloat<?> vector, int offset)
         {
-            int s = findSource(globalOrdinal);
-            views.get(s).getVectorInto(globalOrdinal - globalOffsets[s], vector, offset);
+            views.get(globalToSrcIdx[globalOrdinal]).getVectorInto(globalToNodeId[globalOrdinal], vector, offset);
         }
 
         @Override
@@ -353,20 +443,6 @@ public class CompactionGraphMerger
         public RandomAccessVectorValues copy()
         {
             throw new UnsupportedOperationException("MergedSourceVectorValues cannot be copied");
-        }
-
-        private int findSource(int globalOrdinal)
-        {
-            int lo = 0, hi = sources.size() - 1;
-            while (lo < hi)
-            {
-                int mid = (lo + hi + 1) >>> 1;
-                if (globalOffsets[mid] <= globalOrdinal)
-                    lo = mid;
-                else
-                    hi = mid - 1;
-            }
-            return lo;
         }
     }
 }
