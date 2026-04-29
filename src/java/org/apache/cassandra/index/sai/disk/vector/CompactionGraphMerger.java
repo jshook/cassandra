@@ -181,17 +181,27 @@ public class CompactionGraphMerger
             int maxSegmentRowId) throws IOException
     {
         // --- Step 1: Build all-live FixedBitSets and sequential OffsetMappers ---
-        var liveNodes = new ArrayList<FixedBitSet>(sources.size() - 1);
-        var remappers = new ArrayList<OrdinalMapper>(sources.size() - 1);
+        var liveNodes = new ArrayList<FixedBitSet>(sources.size());
+        var remappers = new ArrayList<OrdinalMapper>(sources.size());
         int offset = 0;
         for (var src : sources)
         {
-            int size = src.graph().size(0);
-            var bs = new FixedBitSet(size);
-            bs.set(0, size);
+            int liveCount = src.graph().size(0);
+            int idBound = src.graph().getIdUpperBound();
+            var bs = new FixedBitSet(idBound);
+            if (idBound == liveCount)
+            {
+                bs.set(0, liveCount);
+            }
+            else
+            {
+                // Segment has tombstoned slots (idBound > liveCount); only mark actual live nodes.
+                var nodeIt = src.graph().getNodes(0);
+                while (nodeIt.hasNext()) bs.set(nodeIt.nextInt());
+            }
             liveNodes.add(bs);
-            remappers.add(new OrdinalMapper.OffsetMapper(offset, size));
-            offset += size;
+            remappers.add(new OrdinalMapper.OffsetMapper(offset, liveCount));
+            offset += liveCount;
         }
         int totalGlobalOrdinals = offset;
 
