@@ -48,6 +48,7 @@ import org.apache.cassandra.index.sai.disk.v5.V5OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.RemappedPostings;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.Structure;
+import org.apache.cassandra.index.sai.disk.vector.VectorCompression.CompressionType;
 import org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings;
 import org.apache.cassandra.index.sai.utils.LowPriorityThreadFactory;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
@@ -64,6 +65,16 @@ import static java.util.stream.Collectors.toList;
  *
  * <p>Each source is represented by a {@link SourceSegment} containing the on-disk graph and its
  * associated {@link CassandraDiskAnn} (for PQ, unit-vectors flag, and the ordinals map).
+ *
+ * <p>Both inline-vector (full-precision) and NVQ-compressed source graphs are supported:
+ * <ul>
+ *   <li>Inline-vector sources: dead-node detection uses full-precision vector lookup in the
+ *       postings map to identify which nodes had all their rows deleted.
+ *   <li>NVQ sources: full-precision vectors are not stored on disk, so dead-node detection is
+ *       skipped; all jvector-live nodes are treated as alive. Deleted rows have no postings and
+ *       are invisible to queries, but the ghost nodes consume graph space. Accurate dead-node
+ *       tracking for NVQ is a follow-up.
+ * </ul>
  *
  * <p><b>Known limitations:</b>
  * <ul>
@@ -138,46 +149,22 @@ public class CompactionGraphMerger
     }
 
     /**
-     * Returns true if all source graphs expose full-precision inline vectors, which is required for
-     * the postings-mapping step to match vectors back to output row IDs. NVQ graphs store quantized
-     * vectors only and are not supported by this merger.
+     * Returns true if a source graph stores full-precision vectors (INLINE_VECTORS or
+     * SEPARATED_VECTORS features), which allows dead-node detection via postings-map lookup.
+     * NVQ graphs ({@code NVQ_VECTORS} or {@code SEPARATED_NVQ}) return false.
      */
-    public static boolean sourcesHaveInlineVectors(List<SourceSegment> sources)
+    static boolean hasFullPrecisionVectors(OnDiskGraphIndex graph)
     {
-        for (var src : sources)
-        {
-            var features = src.graph().getFeatureSet();
-            if (!features.contains(FeatureId.INLINE_VECTORS) && !features.contains(FeatureId.SEPARATED_VECTORS))
-                return false;
-        }
-        return true;
-    }
-
-    /**
-     * Returns true if all source graphs use Product Quantization compression.
-     */
-    public static boolean sourcesUsePQ(List<SourceSegment> sources)
-    {
-        for (var src : sources)
-        {
-            try
-            {
-                src.diskAnn().getPQ();
-            }
-            catch (AssertionError e)
-            {
-                return false;
-            }
-        }
-        return true;
+        var features = graph.getFeatureSet();
+        return features.contains(FeatureId.INLINE_VECTORS) || features.contains(FeatureId.SEPARATED_VECTORS);
     }
 
     /**
      * Merges the source graphs and writes all SAI index components for the output segment.
      *
-     * <p>Dead-node detection: a source graph node is included in the output only if its vector
-     * appears as a key in {@code postingsMap} (meaning at least one of its rows survived
-     * compaction). Nodes from deleted rows are excluded from both the merged graph and the postings.
+     * <p>Dead-node detection: for inline-vector sources, a node is excluded from the output if its
+     * full-precision vector is absent from {@code postingsMap} (all its rows were deleted). For NVQ
+     * sources, dead-node detection is skipped and all jvector-live nodes are included.
      *
      * <p>The TERMS_DATA component is written with a proper SAI codec header and footer: the
      * compacted jvector graph is first written to a temp file, then streamed through an
@@ -193,8 +180,9 @@ public class CompactionGraphMerger
             int maxSegmentRowId) throws IOException
     {
         // --- Step 1: Open graph views and build per-source live bitsets + ordinal mappings ---
-        // Views are opened here (not later) so that vector reads can be used for dead-node
-        // detection: a node is "live" for the output only if its vector appears in postingsMap.
+        // Views are opened here so that vector reads can be used for dead-node detection on
+        // inline-vector sources. For NVQ sources, view.getVector() is unavailable; those nodes
+        // are all marked alive (ghost-node tradeoff, see class Javadoc).
         var views = new ArrayList<OnDiskGraphIndex.View>(sources.size());
         var liveNodes = new ArrayList<FixedBitSet>(sources.size());
         var remappers = new ArrayList<OrdinalMapper>(sources.size());
@@ -212,13 +200,29 @@ public class CompactionGraphMerger
             int idBound = src.graph().getIdUpperBound();
             var bs = new FixedBitSet(idBound);
             var oldToNew = new HashMap<Integer, Integer>();
+            boolean fullPrecision = hasFullPrecisionVectors(src.graph());
 
             var nodeIt = src.graph().getNodes(0);
             while (nodeIt.hasNext())
             {
                 int nid = nodeIt.nextInt();
-                VectorFloat<?> vec = view.getVector(nid);
-                if (postingsMap.containsKey(vec))
+                boolean isAlive;
+                if (fullPrecision)
+                {
+                    // Inline-vector source: look up the full-precision vector in the postings map.
+                    // Absent → all rows were deleted; exclude this node from the output graph.
+                    VectorFloat<?> vec = view.getVector(nid);
+                    isAlive = postingsMap.containsKey(vec);
+                }
+                else
+                {
+                    // NVQ source: full-precision vectors are not stored on disk and cannot be used
+                    // for postings-map lookup. Mark all jvector-live nodes as alive; rows deleted
+                    // from NVQ nodes will have no postings and be invisible to queries.
+                    isAlive = true;
+                }
+
+                if (isAlive)
                 {
                     int globalOrdinal = globalSrcIdxList.size();
                     bs.set(nid);
@@ -242,10 +246,6 @@ public class CompactionGraphMerger
         try  // outer try: closes source graph views
         {
             // --- Step 2: Run the jvector compactor to a temp file, then wrap with SAI header/footer ---
-            // The compactor writes raw jvector format starting at byte 0 and has no awareness of
-            // SAI framing. We write to a sibling temp file, then copy through an IndexOutputWriter
-            // so the CRC accumulates correctly over header + graph data, allowing writeFooter() to
-            // produce a valid SAI checksum that survives scrub validation.
             var termsComponent = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA);
             Path termsParentDir = termsComponent.file().toJavaIOFile().toPath().getParent();
             Path tempGraphPath = Files.createTempFile(termsParentDir, "jvec_compact_", ".tmp");
@@ -297,23 +297,37 @@ public class CompactionGraphMerger
                 SAICodecUtils.writeHeader(postingsOutput);
                 SAICodecUtils.writeHeader(pqOutput);
 
-                // Write PQ from the first source (pre-compaction codebook).
-                // A follow-up will expose the retrained codebook from the compactor.
+                // Write PQ or NVQ compression header depending on source compression type.
+                // All sources are expected to have the same type (enforced by the compactor's
+                // validateFeatures). For PQ: copy the first source's codebook. For NVQ (or no
+                // compression): write a NONE header so readers know no PQ data follows.
                 var firstDiskAnn = sources.get(0).diskAnn();
                 long pqOffset = pqOutput.getFilePointer();
                 var version = perIndexComponents.context().version();
-                CassandraOnHeapGraph.writePqHeader(pqOutput.asSequentialWriter(),
-                                                   firstDiskAnn.isPqUnitVectors(),
-                                                   VectorCompression.CompressionType.PRODUCT_QUANTIZATION,
-                                                   version);
-                ProductQuantization pq = firstDiskAnn.getPQ();
-                pq.write(pqOutput.asSequentialWriter(), version.onDiskFormat().jvectorFileFormatVersion());
+                if (firstDiskAnn.getCompression().type == CompressionType.PRODUCT_QUANTIZATION)
+                {
+                    CassandraOnHeapGraph.writePqHeader(pqOutput.asSequentialWriter(),
+                                                       firstDiskAnn.isPqUnitVectors(),
+                                                       CompressionType.PRODUCT_QUANTIZATION,
+                                                       version);
+                    ProductQuantization pq = firstDiskAnn.getPQ();
+                    pq.write(pqOutput.asSequentialWriter(), version.onDiskFormat().jvectorFileFormatVersion());
+                }
+                else
+                {
+                    // NVQ sources use NONE compression in the Cassandra PQ file.
+                    CassandraOnHeapGraph.writePqHeader(pqOutput.asSequentialWriter(),
+                                                       false,
+                                                       CompressionType.NONE,
+                                                       version);
+                }
                 long pqLength = pqOutput.getFilePointer() - pqOffset;
 
                 // Write postings using ZERO_OR_ONE_TO_MANY.
                 // MergedSourceVectorValues maps each output global ordinal directly to its source
-                // and local node ID. Every ordinal here has postings (dead nodes were excluded in
-                // Step 1), so the null-postings path in V5VectorPostingsWriter is not exercised.
+                // and local node ID. For inline-vector sources, every ordinal here has postings
+                // (dead nodes were excluded in Step 1). For NVQ sources, some ordinals may have
+                // empty postings (the null-safe path in V5VectorPostingsWriter handles these).
                 long postingsOffset = postingsOutput.getFilePointer();
                 var ordinalMapper = new OrdinalMapper.IdentityMapper(totalGlobalOrdinals - 1);
                 var rp = new RemappedPostings(Structure.ZERO_OR_ONE_TO_MANY,
@@ -360,8 +374,8 @@ public class CompactionGraphMerger
      * {@code size(0)}, so the bitset must be sized to {@code idUpperBound} and populated by
      * iterating the actual live-node IDs returned by {@link OnDiskGraphIndex#getNodes(int)}.
      *
-     * <p>Used by tests to verify the tombstone-gap fix in isolation. Production code uses
-     * {@link #buildLiveBitset(OnDiskGraphIndex, OnDiskGraphIndex.View, Map)} instead.
+     * <p>Used by tests to verify the tombstone-gap fix in isolation. Production code inlines
+     * equivalent logic inside {@link #merge} with the additional postings-map check.
      */
     static FixedBitSet buildLiveBitset(OnDiskGraphIndex graph)
     {
@@ -385,7 +399,8 @@ public class CompactionGraphMerger
      * Cassandra-alive (their vector appears as a key in {@code postingsMap}).
      *
      * <p>The bitset is sized to {@code idUpperBound} so that neighbor-ID lookups inside the
-     * compactor never exceed the bitset bounds.
+     * compactor never exceed the bitset bounds. Only valid for graphs with full-precision inline
+     * vectors; see {@link #hasFullPrecisionVectors(OnDiskGraphIndex)}.
      */
     static FixedBitSet buildLiveBitset(OnDiskGraphIndex graph,
                                         OnDiskGraphIndex.View view,

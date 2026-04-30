@@ -40,6 +40,63 @@ CompactionIterator (live rows only)
             └─ V5VectorPostingsWriter (writes ordinal → output row ID postings)
 ```
 
+### Why two phases, and why is Phase 1 reduced to ChronicleMap recording?
+
+**The two-phase structure is imposed by Cassandra's compaction architecture, not a design
+choice specific to the vector index.**
+
+Cassandra's compaction machinery is built around `CompactionIterator`, which is the
+authoritative source of truth for which rows survive into the output SSTable.
+`CompactionIterator` applies tombstone resolution (expired deletes), TTL expiry, and
+deduplication across all input SSTables in one forward pass, emitting only the rows that
+should exist in the compacted output. Every index component — whether it is a term index,
+a numeric index, or a vector index — must hook into this pass via `addRow()` to observe
+each live row as it is emitted. There is no way to determine the final output row set
+without running this iterator; the information simply does not exist before it completes.
+
+The flush (`flushInternal`) happens after `CompactionIterator` has finished — only then is
+it safe to write index files, because only then is the complete output row set known.
+
+**Phase 1 (row-by-row pass) — what it must do:**
+
+For any vector index implementation, Phase 1 must at minimum capture two facts for each
+live output row:
+1. Which vector does this row carry?
+2. What is its output segment row ID?
+
+In the old (build-from-scratch) flow, Phase 1 did far more than this: it inserted every
+vector into an in-memory `GraphIndexBuilder`, computing HNSW edges via distance
+comparisons and graph traversals (`CompactionGraph.addGraphNode()`). This is the most
+expensive part of graph construction.
+
+In the new (merge) flow, we already have high-quality HNSW graphs on disk from the
+previous flush or compaction of each input SSTable. Rebuilding edges from scratch would
+throw away that quality and cost. Instead, Phase 1 is reduced to the minimum:
+**record `vector → output row ID` in a ChronicleMap and nothing else.** No edges are
+computed. No in-memory graph is built.
+
+**Phase 2 (flush) — what it uses that information for:**
+
+`CompactionGraphMerger.merge()` receives the completed ChronicleMap and uses it for two
+purposes:
+
+1. **Dead-node detection.** During Phase 1, only vectors belonging to *surviving* rows
+   were inserted into the ChronicleMap. A source graph node whose vector is absent from the
+   ChronicleMap had all its rows deleted; it is excluded from the merged graph and from the
+   postings file.
+
+2. **Postings file construction.** `V5VectorPostingsWriter` iterates the merged graph's
+   output ordinals, looks up each node's vector in the ChronicleMap, and writes the
+   corresponding output row IDs. The ChronicleMap is the only place that knows which output
+   row IDs a given vector maps to; this information was accumulated solely during Phase 1.
+
+**The ChronicleMap is the bridge between the two phases.** It is written during Phase 1
+(under `CompactionIterator`'s ownership of row liveness) and read during Phase 2 (under
+`flushInternal`'s ownership of file writing). This is why it is an off-heap persistent
+map rather than a plain `HashMap`: compaction can involve millions of vectors, and the
+ChronicleMap avoids putting all that data on the Java heap across the lifetime of the
+compaction job.
+
 ---
 
 ## Integration Points
@@ -128,8 +185,19 @@ else
 **`mergePathApplicable` conditions:**
 - `inputSSTables != null` (compaction operation, not flush)
 - At least 2 source graph segments exist across input SSTables
-- All source graphs expose inline vectors (not NVQ-only)
-- All sources use `PRODUCT_QUANTIZATION` compression
+- V5 format is in use (`V5OnDiskFormat.writeV5VectorPostings` returns true)
+
+Both inline-vector (`INLINE_VECTORS`/`SEPARATED_VECTORS`) and NVQ (`NVQ_VECTORS`)
+source graphs are supported:
+- **Inline-vector sources**: dead-node detection reads the full-precision vector per
+  node and checks `postingsMap.containsKey(vec)` — deleted nodes are excluded from
+  the merged graph entirely.
+- **NVQ sources**: full-precision vectors are unavailable on disk, so all
+  jvector-live nodes are marked alive (ghost-node tradeoff — deleted rows have no
+  postings and are invisible to queries, but consume graph space).
+
+PQ compression in the output follows the first source segment's compression type:
+`PRODUCT_QUANTIZATION` if the source used PQ, `NONE` if it used NVQ.
 
 `termsFileHasContent` guards against the compactor overwriting an earlier segment
 if the merge path is invoked for a second segment (which shouldn't happen given
