@@ -153,7 +153,7 @@ public class CompactionGraphMerger
      * SEPARATED_VECTORS features), which allows dead-node detection via postings-map lookup.
      * NVQ graphs ({@code NVQ_VECTORS} or {@code SEPARATED_NVQ}) return false.
      */
-    static boolean hasFullPrecisionVectors(OnDiskGraphIndex graph)
+    public static boolean hasFullPrecisionVectors(OnDiskGraphIndex graph)
     {
         var features = graph.getFeatureSet();
         return features.contains(FeatureId.INLINE_VECTORS) || features.contains(FeatureId.SEPARATED_VECTORS);

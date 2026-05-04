@@ -186,18 +186,28 @@ else
 - `inputSSTables != null` (compaction operation, not flush)
 - At least 2 source graph segments exist across input SSTables
 - V5 format is in use (`V5OnDiskFormat.writeV5VectorPostings` returns true)
+- **All** source graphs have full-precision vectors (`INLINE_VECTORS` feature) —
+  if any source is NVQ (`NVQ_VECTORS` only), `collectMergeSources()` returns
+  `null` and the whole job falls back to the rebuild path
 
-Both inline-vector (`INLINE_VECTORS`/`SEPARATED_VECTORS`) and NVQ (`NVQ_VECTORS`)
-source graphs are supported:
-- **Inline-vector sources**: dead-node detection reads the full-precision vector per
-  node and checks `postingsMap.containsKey(vec)` — deleted nodes are excluded from
-  the merged graph entirely.
-- **NVQ sources**: full-precision vectors are unavailable on disk, so all
-  jvector-live nodes are marked alive (ghost-node tradeoff — deleted rows have no
-  postings and are invisible to queries, but consume graph space).
+**Why NVQ sources fall back to rebuild:** `OnDiskGraphIndexCompactor.validateFeatures()`
+hard-requires the `INLINE_VECTORS` feature on every source graph and throws
+`IllegalArgumentException` if it is absent. NVQ graphs are written with
+`NVQ_VECTORS` only (no `INLINE_VECTORS`), so passing them to the compactor
+crashes. Since `V5VectorIndexSearcher` is a subclass of `V2VectorIndexSearcher`,
+the `instanceof` filter in `collectMergeSources()` would otherwise include NVQ
+segments silently. The guard added in `collectMergeSources()` catches this:
+if any source graph fails `CompactionGraphMerger.hasFullPrecisionVectors()`,
+the method returns `null` immediately, triggering the existing rebuild path.
+
+Only inline-vector source graphs are handled by the merge path:
+- **Inline-vector sources** (`INLINE_VECTORS`, optionally + `FUSED_PQ`): dead-node
+  detection reads the full-precision vector per node and checks
+  `postingsMap.containsKey(vec)` — deleted nodes are excluded from the merged
+  graph entirely.
 
 PQ compression in the output follows the first source segment's compression type:
-`PRODUCT_QUANTIZATION` if the source used PQ, `NONE` if it used NVQ.
+`PRODUCT_QUANTIZATION` if the source used PQ, `NONE` otherwise.
 
 `termsFileHasContent` guards against the compactor overwriting an earlier segment
 if the merge path is invoked for a second segment (which shouldn't happen given

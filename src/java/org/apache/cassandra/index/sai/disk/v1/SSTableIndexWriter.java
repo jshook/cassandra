@@ -488,6 +488,12 @@ public class SSTableIndexWriter implements PerIndexWriter
                 if (!(searcher instanceof V2VectorIndexSearcher))
                     continue;
                 var diskAnn = ((V2VectorIndexSearcher) searcher).graph;
+                // OnDiskGraphIndexCompactor requires INLINE_VECTORS on every source.
+                // NVQ graphs (NVQ_VECTORS only, no INLINE_VECTORS) are not supported by the
+                // compactor and will throw. Fall back to the rebuild path for the whole job
+                // if any source lacks full-precision vectors.
+                if (!CompactionGraphMerger.hasFullPrecisionVectors(diskAnn.getOnDiskGraph()))
+                    return null;
                 result.add(new CompactionGraphMerger.SourceSegment(diskAnn, segment.metadata.segmentRowIdOffset));
             }
         }
