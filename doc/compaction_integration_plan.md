@@ -255,19 +255,72 @@ invisible to queries).
 
 ## Known Limitations / Follow-ups
 
-### Dead node tracking
-The MVP marks all source nodes live. To avoid including deleted nodes in the
-output graph, we need to build `FixedBitSet` per source by:
-1. For each source segment ordinal, looking up its source SSTable row IDs
-   via `OnDiskOrdinalsMap`
-2. Determining if those rows survived the compaction
+### Dead node tracking — inline-vector sources
+**Implemented.** For sources that store full-precision vectors on disk
+(`INLINE_VECTORS` / `SEPARATED_VECTORS`), dead-node detection is done in
+`CompactionGraphMerger.merge()`: each source graph node's full-precision
+vector is read from the view and checked against `postingsMap`. Absent means
+all of that node's rows were deleted; the node is excluded from the output
+graph entirely (not included in the `FixedBitSet` or the global ordinal
+assignment).
 
-Approach A: During the row-by-row pass, track which source-segment row IDs
-appear in the output (requires the compaction layer to expose per-source row
-origins — currently abstracted away by `CompactionIterator`).
+The ChronicleMap built during Phase 1 serves as the liveness oracle — it
+already records exactly which vectors belong to surviving rows, so no
+additional pass or `OnDiskOrdinalsMap` lookup is needed.
 
-Approach B: Query tombstone data directly per source SSTable
-(via `CompactionController`) for each ordinal's rows.
+### Dead node tracking — NVQ sources
+**Unresolved (ghost-node tradeoff, with concrete fix identified).** Full-precision
+vectors are not stored on disk for NVQ sources, so the inline-vector
+postings-map lookup cannot be used. All jvector-live nodes are currently marked
+alive. Ghost nodes have no postings and are invisible to queries, but they
+consume graph space, degrade search quality, and — critically — accumulate
+across compactions: because ghost nodes are carried forward into every merged
+output graph, deleted NVQ rows effectively leak into the graph permanently
+until a full rebuild.
+
+**Why the inline-vector approach does not apply:** `CompactionIterator` applies
+tombstone resolution (`GarbageSkipper`) before rows reach the index writer, so
+Phase 1 only observes live rows. For inline-vector sources, the ChronicleMap
+built during Phase 1 directly serves as the liveness oracle (look up a source
+node's full-precision vector — present means alive, absent means dead). NVQ
+breaks this because the graph stores only lossy compressed codes; there is no
+full-precision vector to look up.
+
+**Concrete fix — PrimaryKey pre-pass (no compaction pipeline changes needed):**
+
+The `PrimaryKey` (partition key + clustering) is available all the way down to
+`SegmentBuilder.add()`, one level above `addInternalAsync()` where it is
+currently dropped. Threading it one level further is a trivial signature change.
+`SSTableIndexWriter` already holds `inputSSTables`, so the source SSTables are
+accessible without any compaction-machinery changes.
+
+*Before Phase 1* (in `VectorMergeSegmentBuilder` constructor, for each NVQ source):
+1. Invert the source `OnDiskOrdinalsMap` to build `sourceRowId → sourceOrdinal`.
+2. Scan the source `SSTableReader` in row order, pairing each row with its
+   row ID to produce `PrimaryKey → sourceOrdinal`.
+3. Store a `Map<PrimaryKey, Integer>` per NVQ source segment.
+
+This is a single sequential pass per source SSTable — the same data compaction
+reads anyway.
+
+*During Phase 1* (`addInternalAsync`, with `PrimaryKey` threaded through):
+For each live row, look up its `PrimaryKey` in the per-source maps and set the
+corresponding bit in a per-source `FixedBitSet`.
+
+*Phase 2*: pass the per-source `FixedBitSet` arrays to `CompactionGraphMerger`
+instead of the all-alive bitsets currently built inside `merge()`.
+
+**Code changes required** (all within SAI vector compaction code):
+- `SegmentBuilder.add()` → `addInternalAsync()`: add `PrimaryKey key` parameter
+  to the base-class signature and both subclasses (mechanical).
+- `VectorMergeSegmentBuilder` constructor: add the pre-pass above for NVQ sources.
+- `VectorMergeSegmentBuilder.addInternalAsync()`: use the key to set bits.
+- `VectorMergeSegmentBuilder.flushInternal()` / `CompactionGraphMerger.merge()`:
+  accept the per-source live-ordinal bitsets as input instead of building
+  all-alive bitsets internally.
+
+Estimated effort: ~2–3 days. No changes to `CompactionIterator` or any other
+core Cassandra compaction class are required.
 
 ### PQ retraining
 The compactor internally retrains PQ on the merged dataset. The retrained
