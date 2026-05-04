@@ -22,11 +22,15 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ForkJoinPool;
 import java.util.function.IntFunction;
 
@@ -36,15 +40,20 @@ import org.junit.Test;
 
 import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.GraphSearcher;
+import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.ListRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexCompactor;
 import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
+import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
+import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.FixedBitSet;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -496,6 +505,116 @@ public class CompactionGraphMergerTest
     }
 
     // -------------------------------------------------------------------------
+    // Merge vs. rebuild: recall and timing comparison
+    // -------------------------------------------------------------------------
+
+    /**
+     * Builds source graphs via {@link GraphIndexBuilder}, compacts them with
+     * {@link OnDiskGraphIndexCompactor} (the merge path), then also rebuilds a fresh graph from
+     * all the same vectors (the rebuild path). Searches both with a fixed query set and asserts
+     * that recall vs. brute-force ground truth is similar between the two.
+     *
+     * <p>The test also prints wall-clock time for each path so the timing difference is visible
+     * when the test is run manually.
+     *
+     * <p>Ordinal invariant: source {@code s} contributes vectors at positions
+     * {@code [offset_s, offset_s + VECS_PER_SOURCE)} in {@code allVecs}. The remapper assigns
+     * global ordinals with the same layout, so ordinal {@code k} in the merged graph always
+     * corresponds to {@code allVecs.get(k)}. The brute-force ground truth uses the same indexing,
+     * so recall is computed by direct ordinal comparison.
+     */
+    @Test
+    public void testMergeVsRebuildRecall() throws IOException
+    {
+        final int DIM_R = 32;
+        final int VECS_PER_SOURCE = 300;
+        final int NUM_SOURCES = 3;
+        final int NUM_QUERIES = 50;
+        final int TOP_K = 10;
+        final VectorSimilarityFunction vsf = VectorSimilarityFunction.EUCLIDEAN;
+
+        // Build per-source vector lists, then concatenate into allVecs.
+        // The concatenation order defines the expected global ordinals in the merged graph.
+        List<List<VectorFloat<?>>> sourceVecs = new ArrayList<>(NUM_SOURCES);
+        for (int s = 0; s < NUM_SOURCES; s++)
+            sourceVecs.add(makeRandomVectors(VECS_PER_SOURCE, DIM_R, s * 12345L));
+
+        List<VectorFloat<?>> allVecs = new ArrayList<>(VECS_PER_SOURCE * NUM_SOURCES);
+        for (var sv : sourceVecs) allVecs.addAll(sv);
+
+        List<VectorFloat<?>> queries = makeRandomVectors(NUM_QUERIES, DIM_R, 99999L);
+        List<Set<Integer>> groundTruth = bruteForceTopK(queries, allVecs, vsf, TOP_K);
+
+        // --- Build source on-disk graphs ---
+        List<OnDiskGraphIndex> sourceGraphs = new ArrayList<>(NUM_SOURCES);
+        for (int s = 0; s < NUM_SOURCES; s++)
+            sourceGraphs.add(buildRealisticGraph(sourceVecs.get(s), DIM_R, vsf, "rsrc_" + s));
+
+        // --- Merge path ---
+        // Each source's local ordinals map sequentially to global ordinals (all nodes are alive).
+        List<FixedBitSet> liveNodes = new ArrayList<>(NUM_SOURCES);
+        List<OrdinalMapper> remappers = new ArrayList<>(NUM_SOURCES);
+        int globalOffset = 0;
+        for (int s = 0; s < NUM_SOURCES; s++)
+        {
+            int n = VECS_PER_SOURCE;
+            var bs = new FixedBitSet(n);
+            bs.set(0, n);
+            liveNodes.add(bs);
+
+            var oldToNew = new HashMap<Integer, Integer>(n * 2);
+            for (int i = 0; i < n; i++) oldToNew.put(i, globalOffset + i);
+            remappers.add(new OrdinalMapper.MapMapper(oldToNew));
+            globalOffset += n;
+        }
+
+        Path mergedPath = tempDir.resolve("merged_graph");
+        long mergeStart = System.nanoTime();
+        new OnDiskGraphIndexCompactor(sourceGraphs, liveNodes, remappers, vsf, fjp)
+                .compact(mergedPath);
+        long mergeMs = (System.nanoTime() - mergeStart) / 1_000_000;
+
+        // --- Rebuild path ---
+        // All vectors in one shot; ordinals 0..N-1 match allVecs order.
+        RandomAccessVectorValues allRavv = new ListRandomAccessVectorValues(allVecs, DIM_R);
+        Path rebuiltPath = tempDir.resolve("rebuilt_graph");
+        long rebuildStart = System.nanoTime();
+        {
+            var bsp = BuildScoreProvider.randomAccessScoreProvider(allRavv, vsf);
+            var builder = new GraphIndexBuilder(bsp, DIM_R, 16, 100, 1.2f, 1.2f, false, true, fjp, fjp);
+            for (int i = 0; i < allVecs.size(); i++) builder.addGraphNode(i, allVecs.get(i));
+            builder.cleanup();
+
+            int totalN = allVecs.size();
+            Map<FeatureId, IntFunction<Feature.State>> suppliers = new EnumMap<>(FeatureId.class);
+            suppliers.put(FeatureId.INLINE_VECTORS, ord -> new InlineVectors.State(allRavv.getVector(ord)));
+            try (var writer = new OnDiskGraphIndexWriter.Builder(builder.getGraph(), rebuiltPath)
+                    .withMapper(new OrdinalMapper.IdentityMapper(totalN - 1))
+                    .with(new InlineVectors(DIM_R))
+                    .build())
+            {
+                writer.write(suppliers);
+            }
+        }
+        long rebuildMs = (System.nanoTime() - rebuildStart) / 1_000_000;
+
+        // --- Recall comparison ---
+        var mergedGraph = OnDiskGraphIndex.load(ReaderSupplierFactory.open(mergedPath));
+        var rebuiltGraph = OnDiskGraphIndex.load(ReaderSupplierFactory.open(rebuiltPath));
+
+        double mergeRecall = computeRecall(queries, mergedGraph, vsf, groundTruth, TOP_K);
+        double rebuildRecall = computeRecall(queries, rebuiltGraph, vsf, groundTruth, TOP_K);
+
+        System.out.printf("[merge-vs-rebuild] timing: merge=%dms rebuild=%dms | recall: merge=%.3f rebuild=%.3f%n",
+                          mergeMs, rebuildMs, mergeRecall, rebuildRecall);
+
+        assertTrue("merge recall should exceed 0.70, got " + mergeRecall, mergeRecall >= 0.70);
+        assertTrue("rebuild recall should exceed 0.70, got " + rebuildRecall, rebuildRecall >= 0.70);
+        assertTrue("recall difference should be < 0.15, got " + Math.abs(mergeRecall - rebuildRecall),
+                   Math.abs(mergeRecall - rebuildRecall) < 0.15);
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
@@ -556,6 +675,110 @@ public class CompactionGraphMergerTest
             writer.write(suppliers);
         }
         return OnDiskGraphIndex.load(ReaderSupplierFactory.open(out));
+    }
+
+    /** Returns {@code n} random vectors in [-1, 1]^dim generated from the given seed. */
+    private List<VectorFloat<?>> makeRandomVectors(int n, int dim, long seed)
+    {
+        var rng = new Random(seed);
+        var result = new ArrayList<VectorFloat<?>>(n);
+        for (int i = 0; i < n; i++)
+        {
+            float[] data = new float[dim];
+            for (int d = 0; d < dim; d++) data[d] = rng.nextFloat() * 2 - 1;
+            result.add(vts.createFloatVector(data));
+        }
+        return result;
+    }
+
+    /**
+     * Like {@link #buildCleanGraph} but with M=16 and efConstruction=100 so the graph has
+     * realistic quality for recall testing.
+     */
+    private OnDiskGraphIndex buildRealisticGraph(List<VectorFloat<?>> vecs, int dim,
+                                                  VectorSimilarityFunction vsf, String name)
+            throws IOException
+    {
+        int n = vecs.size();
+        RandomAccessVectorValues ravv = new ListRandomAccessVectorValues(vecs, dim);
+        var bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, vsf);
+        var builder = new GraphIndexBuilder(bsp, dim, 16, 100, 1.2f, 1.2f, false, true, fjp, fjp);
+        for (int i = 0; i < n; i++) builder.addGraphNode(i, vecs.get(i));
+        builder.cleanup();
+
+        Map<FeatureId, IntFunction<Feature.State>> suppliers = new EnumMap<>(FeatureId.class);
+        suppliers.put(FeatureId.INLINE_VECTORS, ord -> new InlineVectors.State(ravv.getVector(ord)));
+
+        Path out = tempDir.resolve(name);
+        try (var writer = new OnDiskGraphIndexWriter.Builder(builder.getGraph(), out)
+                .withMapper(new OrdinalMapper.IdentityMapper(n - 1))
+                .with(new InlineVectors(dim))
+                .build())
+        {
+            writer.write(suppliers);
+        }
+        return OnDiskGraphIndex.load(ReaderSupplierFactory.open(out));
+    }
+
+    /**
+     * Returns exact top-{@code k} ordinals (into {@code dataset}) for each query via exhaustive
+     * search. Used as ground truth for recall computation.
+     */
+    private List<Set<Integer>> bruteForceTopK(List<VectorFloat<?>> queries,
+                                               List<VectorFloat<?>> dataset,
+                                               VectorSimilarityFunction vsf,
+                                               int k)
+    {
+        int n = dataset.size();
+        var result = new ArrayList<Set<Integer>>(queries.size());
+        // Reuse this permutation array across queries; each sort produces the correct ranking
+        // for the current scores regardless of the previous permutation order.
+        Integer[] indices = new Integer[n];
+        for (int i = 0; i < n; i++) indices[i] = i;
+
+        for (var query : queries)
+        {
+            float[] scores = new float[n];
+            for (int i = 0; i < n; i++) scores[i] = vsf.compare(query, dataset.get(i));
+            Arrays.sort(indices, (a, b) -> Float.compare(scores[b], scores[a]));
+            var topK = new HashSet<Integer>(k * 2);
+            for (int i = 0; i < k; i++) topK.add(indices[i]);
+            result.add(topK);
+        }
+        return result;
+    }
+
+    /**
+     * Searches {@code graph} for each query and returns recall@k vs. {@code groundTruth}.
+     * Recall is the fraction of true top-k neighbors that appear in the graph's top-k results.
+     */
+    private double computeRecall(List<VectorFloat<?>> queries,
+                                  OnDiskGraphIndex graph,
+                                  VectorSimilarityFunction vsf,
+                                  List<Set<Integer>> groundTruth,
+                                  int k)
+    {
+        int totalHits = 0;
+        try (var searcher = new GraphSearcher(graph))
+        {
+            for (int q = 0; q < queries.size(); q++)
+            {
+                // Inline-vector graphs have no separate approximate scorer; use the exact
+                // reranker for all scoring (which reads inline vectors from the view).
+                var view = (ImmutableGraphIndex.ScoringView) searcher.getView();
+                var rr = view.rerankerFor(queries.get(q), vsf);
+                var result = searcher.search(new DefaultSearchScoreProvider(rr), k, Bits.ALL);
+                var found = new HashSet<Integer>(k * 2);
+                for (var ns : result.getNodes()) found.add(ns.node);
+                for (int ord : groundTruth.get(q))
+                    if (found.contains(ord)) totalHits++;
+            }
+        }
+        catch (Exception e)
+        {
+            throw new RuntimeException(e);
+        }
+        return (double) totalHits / ((double) queries.size() * k);
     }
 
     /**
