@@ -124,27 +124,30 @@ A new class that wraps `OnDiskGraphIndexCompactor`. It:
 
 - Accepts `List<SourceSegment>` — each wrapping a `CassandraDiskAnn` and
   the segment's row-ID offset
-- Builds `FixedBitSet` (all-live for MVP; dead-node computation is a follow-up)
-- Builds `OrdinalMapper.OffsetMapper` per source with sequential offsets
+- **Validates upfront** that all sources have `INLINE_VECTORS` and consistent
+  `FUSED_PQ` presence; throws `IllegalStateException` immediately for any other
+  feature set so the caller can fall back to the legacy rebuild path
+- Builds per-source `FixedBitSet` and `OrdinalMapper.MapMapper` using postings-map
+  dead-node detection (see §Dead Nodes below)
 - Calls `OnDiskGraphIndexCompactor.compact(outputPath)`
+- When `FUSED_PQ` is in use, reads the retrained PQ codebook back from the
+  compacted graph file and writes it to the Cassandra PQ component
 - Writes `POSTING_LISTS` using `V5VectorPostingsWriter` with
   `ZERO_OR_ONE_TO_MANY` structure and an identity mapper
-- Writes `PQ` from the first source segment's `ProductQuantization` codebook
+- Writes `PQ` with `CompressionType.NONE` when sources have no compression
 
 **Postings approach:** The caller passes the vector → output-row-IDs
 `ChronicleMap` built during the row-by-row pass. Postings lookup at write time:
 `ordinal → MergedSourceVectorValues.getVector(ordinal) → postingsMap.get(vector) → rowIds`.
 
-**PQ output note:** The compactor internally retrains PQ; for the first
-implementation the source PQ codebook (from `source[0].getPQ()`) is written to
-the Cassandra PQ file. A follow-up should expose the retrained codebook from
-the compactor.
+**Supported source feature sets:**
+- `INLINE_VECTORS` only (current Cassandra write path): full dead-node detection,
+  PQ component written with `CompressionType.NONE`.
+- `INLINE_VECTORS` + `FUSED_PQ` (next release): full dead-node detection,
+  retrained PQ codebook extracted from compacted graph and written to PQ component.
 
-**MVP limitation — live nodes:** All source nodes are marked live (`FixedBitSet`
-all-true). Deleted nodes have no postings in the output and are therefore
-invisible to queries, but they consume graph space. Accurate dead-node tracking
-requires knowing which source SSTable row IDs survive the compaction; this is
-a follow-up (see §Dead Nodes below).
+Any other feature set (NVQ, separated vectors) causes `merge()` to throw
+`IllegalStateException` before touching the compactor.
 
 ---
 
@@ -186,28 +189,24 @@ else
 - `inputSSTables != null` (compaction operation, not flush)
 - At least 2 source graph segments exist across input SSTables
 - V5 format is in use (`V5OnDiskFormat.writeV5VectorPostings` returns true)
-- **All** source graphs have full-precision vectors (`INLINE_VECTORS` feature) —
-  if any source is NVQ (`NVQ_VECTORS` only), `collectMergeSources()` returns
-  `null` and the whole job falls back to the rebuild path
+- **All** source graphs have `INLINE_VECTORS` — if any source lacks it (e.g. NVQ
+  sources have `NVQ_VECTORS` only), `collectMergeSources()` returns `null` and
+  the whole job falls back to the rebuild path
 
 **Why NVQ sources fall back to rebuild:** `OnDiskGraphIndexCompactor.validateFeatures()`
 hard-requires the `INLINE_VECTORS` feature on every source graph and throws
 `IllegalArgumentException` if it is absent. NVQ graphs are written with
 `NVQ_VECTORS` only (no `INLINE_VECTORS`), so passing them to the compactor
-crashes. Since `V5VectorIndexSearcher` is a subclass of `V2VectorIndexSearcher`,
-the `instanceof` filter in `collectMergeSources()` would otherwise include NVQ
-segments silently. The guard added in `collectMergeSources()` catches this:
-if any source graph fails `CompactionGraphMerger.hasFullPrecisionVectors()`,
-the method returns `null` immediately, triggering the existing rebuild path.
+would crash. `CompactionGraphMerger.merge()` also validates this upfront and
+throws `IllegalStateException` — but the check in `collectMergeSources()` catches
+it earlier so the fallback is clean.
 
 Only inline-vector source graphs are handled by the merge path:
-- **Inline-vector sources** (`INLINE_VECTORS`, optionally + `FUSED_PQ`): dead-node
-  detection reads the full-precision vector per node and checks
-  `postingsMap.containsKey(vec)` — deleted nodes are excluded from the merged
-  graph entirely.
-
-PQ compression in the output follows the first source segment's compression type:
-`PRODUCT_QUANTIZATION` if the source used PQ, `NONE` otherwise.
+- **`INLINE_VECTORS` only** (current Cassandra write path): dead-node detection
+  reads the full-precision vector per node and checks `postingsMap.containsKey(vec)`.
+  PQ component written with `CompressionType.NONE`.
+- **`INLINE_VECTORS` + `FUSED_PQ`** (next release): same dead-node detection.
+  Retrained PQ codebook extracted from compacted graph and written to PQ component.
 
 `termsFileHasContent` guards against the compactor overwriting an earlier segment
 if the merge path is invoked for a second segment (which shouldn't happen given
@@ -279,64 +278,23 @@ already records exactly which vectors belong to surviving rows, so no
 additional pass or `OnDiskOrdinalsMap` lookup is needed.
 
 ### Dead node tracking — NVQ sources
-**Unresolved (ghost-node tradeoff, with concrete fix identified).** Full-precision
-vectors are not stored on disk for NVQ sources, so the inline-vector
-postings-map lookup cannot be used. All jvector-live nodes are currently marked
-alive. Ghost nodes have no postings and are invisible to queries, but they
-consume graph space, degrade search quality, and — critically — accumulate
-across compactions: because ghost nodes are carried forward into every merged
-output graph, deleted NVQ rows effectively leak into the graph permanently
-until a full rebuild.
-
-**Why the inline-vector approach does not apply:** `CompactionIterator` applies
-tombstone resolution (`GarbageSkipper`) before rows reach the index writer, so
-Phase 1 only observes live rows. For inline-vector sources, the ChronicleMap
-built during Phase 1 directly serves as the liveness oracle (look up a source
-node's full-precision vector — present means alive, absent means dead). NVQ
-breaks this because the graph stores only lossy compressed codes; there is no
-full-precision vector to look up.
-
-**Concrete fix — PrimaryKey pre-pass (no compaction pipeline changes needed):**
-
-The `PrimaryKey` (partition key + clustering) is available all the way down to
-`SegmentBuilder.add()`, one level above `addInternalAsync()` where it is
-currently dropped. Threading it one level further is a trivial signature change.
-`SSTableIndexWriter` already holds `inputSSTables`, so the source SSTables are
-accessible without any compaction-machinery changes.
-
-*Before Phase 1* (in `VectorMergeSegmentBuilder` constructor, for each NVQ source):
-1. Invert the source `OnDiskOrdinalsMap` to build `sourceRowId → sourceOrdinal`.
-2. Scan the source `SSTableReader` in row order, pairing each row with its
-   row ID to produce `PrimaryKey → sourceOrdinal`.
-3. Store a `Map<PrimaryKey, Integer>` per NVQ source segment.
-
-This is a single sequential pass per source SSTable — the same data compaction
-reads anyway.
-
-*During Phase 1* (`addInternalAsync`, with `PrimaryKey` threaded through):
-For each live row, look up its `PrimaryKey` in the per-source maps and set the
-corresponding bit in a per-source `FixedBitSet`.
-
-*Phase 2*: pass the per-source `FixedBitSet` arrays to `CompactionGraphMerger`
-instead of the all-alive bitsets currently built inside `merge()`.
-
-**Code changes required** (all within SAI vector compaction code):
-- `SegmentBuilder.add()` → `addInternalAsync()`: add `PrimaryKey key` parameter
-  to the base-class signature and both subclasses (mechanical).
-- `VectorMergeSegmentBuilder` constructor: add the pre-pass above for NVQ sources.
-- `VectorMergeSegmentBuilder.addInternalAsync()`: use the key to set bits.
-- `VectorMergeSegmentBuilder.flushInternal()` / `CompactionGraphMerger.merge()`:
-  accept the per-source live-ordinal bitsets as input instead of building
-  all-alive bitsets internally.
-
-Estimated effort: ~2–3 days. No changes to `CompactionIterator` or any other
-core Cassandra compaction class are required.
+**Not applicable — NVQ sources fall back to the legacy rebuild path.**
+`OnDiskGraphIndexCompactor` hard-requires `INLINE_VECTORS` on every source;
+NVQ graphs (`NVQ_VECTORS` only, no `INLINE_VECTORS`) cannot be passed to the
+compactor. `CompactionGraphMerger.merge()` validates this upfront and throws
+`IllegalStateException`, and `collectMergeSources()` catches this earlier to
+trigger a clean fallback to `VectorOffHeapSegmentBuilder`. No ghost-node
+accumulation occurs because NVQ compactions always take the rebuild path.
 
 ### PQ retraining
-The compactor internally retrains PQ on the merged dataset. The retrained
-codebook should be written to the Cassandra PQ file instead of the source PQ.
-Requires an API on `OnDiskGraphIndexCompactor` to expose the retrained
-`ProductQuantization` after `compact()` returns.
+**Implemented.** When sources have `FUSED_PQ`, the compactor retrains the PQ
+codebook and embeds it in the output graph file. After `compact()` returns,
+`CompactionGraphMerger.merge()` opens the compacted graph with
+`ReaderSupplierFactory`, reads the `FusedPQ` feature's `ProductQuantization`,
+and writes that retrained codebook to the Cassandra PQ component. This ensures
+query encoding at search time uses the same codebook as the in-graph compressed
+neighbor scores. No jvector API change was required — the codebook is readable
+directly from the written graph file.
 
 ### SAI codec header/footer for TERMS_DATA
 **Implemented.** The merge path now writes the raw jvector graph to a sibling

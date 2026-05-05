@@ -50,15 +50,20 @@ import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndexWriter;
 import io.github.jbellis.jvector.graph.disk.OrdinalMapper;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
+import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
+import io.github.jbellis.jvector.quantization.PQVectors;
+import io.github.jbellis.jvector.quantization.ProductQuantization;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.FixedBitSet;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+
+import static io.github.jbellis.jvector.quantization.KMeansPlusPlusClusterer.UNWEIGHTED;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -615,6 +620,56 @@ public class CompactionGraphMergerTest
     }
 
     // -------------------------------------------------------------------------
+    // validateFeatureSets — upfront validation extracted for testability
+    // -------------------------------------------------------------------------
+
+    /**
+     * Two INLINE_VECTORS-only graphs: both sources have the same (no-FUSED_PQ) feature set.
+     * {@code validateFeatureSets} should return {@code false} and not throw.
+     */
+    @Test
+    public void testValidateFeatureSetsPasses_InlineOnly() throws IOException
+    {
+        OnDiskGraphIndex g0 = buildCleanGraph(makeDistinctVectors(8, 0.0f), "vfs_inline_g0");
+        OnDiskGraphIndex g1 = buildCleanGraph(makeDistinctVectors(8, 100.0f), "vfs_inline_g1");
+
+        boolean hasFusedPQ = CompactionGraphMerger.validateFeatureSets(List.of(g0, g1));
+
+        assertFalse("INLINE_VECTORS-only sources should report hasFusedPQ=false", hasFusedPQ);
+    }
+
+    /**
+     * Two INLINE_VECTORS + FUSED_PQ graphs: both sources have the same feature set.
+     * {@code validateFeatureSets} should return {@code true} and not throw.
+     */
+    @Test
+    public void testValidateFeatureSetsPasses_FusedPQ() throws IOException
+    {
+        // FusedPQ requires exactly 256 clusters, so we need enough training vectors.
+        List<VectorFloat<?>> vecs0 = makeRandomVectors(300, DIM, 11L);
+        List<VectorFloat<?>> vecs1 = makeRandomVectors(300, DIM, 22L);
+        OnDiskGraphIndex g0 = buildFusedPQGraph(vecs0, "vfs_fpq_g0");
+        OnDiskGraphIndex g1 = buildFusedPQGraph(vecs1, "vfs_fpq_g1");
+
+        boolean hasFusedPQ = CompactionGraphMerger.validateFeatureSets(List.of(g0, g1));
+
+        assertTrue("FUSED_PQ sources should report hasFusedPQ=true", hasFusedPQ);
+    }
+
+    /**
+     * One INLINE_VECTORS-only source and one INLINE_VECTORS + FUSED_PQ source:
+     * inconsistent FUSED_PQ presence must cause {@code validateFeatureSets} to throw.
+     */
+    @Test(expected = IllegalStateException.class)
+    public void testValidateFeatureSetsThrows_InconsistentFusedPQ() throws IOException
+    {
+        OnDiskGraphIndex plain = buildCleanGraph(makeDistinctVectors(8, 0.0f), "vfs_inconsistent_plain");
+        OnDiskGraphIndex fused = buildFusedPQGraph(makeRandomVectors(300, DIM, 33L), "vfs_inconsistent_fused");
+
+        CompactionGraphMerger.validateFeatureSets(List.of(plain, fused));
+    }
+
+    // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
 
@@ -779,6 +834,48 @@ public class CompactionGraphMergerTest
             throw new RuntimeException(e);
         }
         return (double) totalHits / ((double) queries.size() * k);
+    }
+
+    /**
+     * Builds and loads a graph with both {@code INLINE_VECTORS} and {@code FUSED_PQ} features.
+     * FusedPQ requires exactly 256 clusters, so {@code vecs} must contain at least 256 entries.
+     * Uses 2 PQ subspaces (each of dimension {@code DIM/2}).
+     */
+    private OnDiskGraphIndex buildFusedPQGraph(List<VectorFloat<?>> vecs, String name)
+            throws IOException
+    {
+        int n = vecs.size();
+        RandomAccessVectorValues ravv = new ListRandomAccessVectorValues(vecs, DIM);
+        ProductQuantization pq = ProductQuantization.compute(ravv, 2, 256, false, UNWEIGHTED, fjp, fjp);
+        PQVectors pqv = (PQVectors) pq.encodeAll(ravv, fjp);
+
+        var bsp = BuildScoreProvider.pqBuildScoreProvider(VSF, pqv);
+        var builder = new GraphIndexBuilder(bsp, DIM, 4, 20, 1.2f, 1.2f, false, true, fjp, fjp);
+        var graph = builder.getGraph();
+
+        Path out = tempDir.resolve(name);
+        var writer = new OnDiskGraphIndexWriter.Builder(graph, out)
+                .withMapper(new OrdinalMapper.IdentityMapper(n - 1))
+                .with(new InlineVectors(DIM))
+                .with(new FusedPQ(graph.maxDegree(), pq))
+                .build();
+
+        // FusedPQ requires interleaved writeInline calls during graph construction.
+        for (int node = 0; node < n; node++)
+        {
+            var stateMap = new EnumMap<FeatureId, Feature.State>(FeatureId.class);
+            stateMap.put(FeatureId.INLINE_VECTORS, new InlineVectors.State(ravv.getVector(node)));
+            writer.writeInline(node, stateMap);
+            builder.addGraphNode(node, ravv.getVector(node));
+        }
+        builder.cleanup();
+
+        Map<FeatureId, IntFunction<Feature.State>> suppliers = new EnumMap<>(FeatureId.class);
+        suppliers.put(FeatureId.INLINE_VECTORS, ord -> new InlineVectors.State(ravv.getVector(ord)));
+        suppliers.put(FeatureId.FUSED_PQ, ord -> new FusedPQ.State(graph.getView(), pqv, ord));
+        writer.write(suppliers);
+
+        return OnDiskGraphIndex.load(ReaderSupplierFactory.open(out));
     }
 
     /**
