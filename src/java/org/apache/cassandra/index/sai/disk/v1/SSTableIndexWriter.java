@@ -399,11 +399,10 @@ public class SSTableIndexWriter implements PerIndexWriter
         if (indexContext.isVector())
         {
             // --- Merge path: delegate graph construction to jvector's OnDiskGraphIndexCompactor ---
-            // Conditions: compaction operation (inputSSTables != null), no prior output segments
-            // (so the TERMS_DATA file is empty), at least 2 source segments, and V5 format
-            // (ZERO_OR_ONE_TO_MANY postings support). Both inline-vector and NVQ source graphs
-            // are supported; dead-node detection uses postingsMap for inline sources and marks
-            // all jvector-live nodes alive for NVQ sources (ghost-node tradeoff).
+            // Conditions: no prior output segments (segments.isEmpty()), at least 2 INLINE_VECTORS
+            // source segments collected by collectMergeSources(), V5 format, and the killswitch
+            // enabled. Sources lacking INLINE_VECTORS (e.g. NVQ) cause collectMergeSources() to
+            // return null, falling back to the legacy rebuild path.
             var sourcesForMerge = segments.isEmpty() ? collectMergeSources() : null;
             if (CompactionGraphMerger.ENABLED
                 && sourcesForMerge != null

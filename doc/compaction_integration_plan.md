@@ -103,17 +103,17 @@ compaction job.
 
 ### 1. `CassandraDiskAnn.java` — Expose source graph data
 **File:** `src/java/org/apache/cassandra/index/sai/disk/vector/CassandraDiskAnn.java`
+**Status: Implemented.**
 
-Add public accessors so the compactor path can read the on-disk graph and its
+Public accessors added so the compactor path can read the on-disk graph and its
 ordinals map from an existing segment:
 
 ```java
 public OnDiskGraphIndex getOnDiskGraph()    // cast from ImmutableGraphIndex
 public OnDiskOrdinalsMap getOrdinalsMap()   // for ordinal→rowId mapping
 public boolean isPqUnitVectors()            // needed when writing PQ to output
+public ProductQuantization getPQ()          // already existed
 ```
-
-`getPQ()` already exists on `CassandraDiskAnn`.
 
 ---
 
@@ -153,112 +153,129 @@ Any other feature set (NVQ, separated vectors) causes `merge()` to throw
 
 ### 3. `SegmentBuilder.VectorMergeSegmentBuilder` — New builder variant
 **File:** `src/java/org/apache/cassandra/index/sai/disk/v1/SegmentBuilder.java`
+**Status: Implemented.**
 
-New static inner class `VectorMergeSegmentBuilder` alongside the existing
-`VectorOffHeapSegmentBuilder`. It:
+Static inner class `VectorMergeSegmentBuilder` alongside the existing
+`VectorOffHeapSegmentBuilder`. Constructor signature:
 
-- Constructor: takes `List<CompactionGraphMerger.SourceSegment>` for the
-  merge, plus standard builder args
-- Allocates a `ChronicleMap<VectorFloat<?>, CompactionVectorPostings>` (like
-  `CompactionGraph`) to track `vector → output row IDs` during the row-by-row pass
+```java
+public VectorMergeSegmentBuilder(
+    IndexComponents.ForWrite components,
+    long rowIdOffset,
+    long estimatedRows,
+    List<CompactionGraphMerger.SourceSegment> sourceSegments,
+    NamedMemoryLimiter limiter)
+```
+
+Key behaviours:
+
+- Allocates a `ChronicleMap<VectorFloat<?>, CompactionVectorPostings>` persisted
+  to a sibling temp file to track `vector → output row IDs` during the row-by-row pass
+- `addInternal()`: throws `UnsupportedOperationException` — only the async path is used
 - `addInternalAsync()`: records each incoming vector and its output segment row
-  ID into the ChronicleMap; **does not build graph edges**
+  ID into the ChronicleMap; **does not build graph edges**; returns `0` (no memory charged)
+- `supportsAsyncAdd()`: returns `true`
 - `flushInternal()`: calls `CompactionGraphMerger.merge()` passing the
-  ChronicleMap and metadata
-- `requiresFlush()`: returns `false` — the merge path writes one output segment
-  regardless of size; if memory pressure forces an early flush, the second
-  segment falls back to `VectorOffHeapSegmentBuilder`
+  ChronicleMap and `maxSegmentRowId`
+- `requiresFlush()`: returns `false` — the merge builder is never flushed early
+  due to size; if a second segment is ever requested, `segments.isEmpty()` is
+  false in `newSegmentBuilder()` and the normal path (off-heap or on-heap) is used
+- `release()`: closes and deletes the ChronicleMap temp file
 
 ---
 
 ### 4. `SSTableIndexWriter.newSegmentBuilder()` — Decision point
 **File:** `src/java/org/apache/cassandra/index/sai/disk/v1/SSTableIndexWriter.java`
+**Status: Implemented.**
 
-Add a third branch to the vector builder selection (lines 381–398):
+Vector builder selection logic in `newSegmentBuilder()`:
 
-```
-if (mergePathApplicable && segments.isEmpty() && !termsFileHasContent)
-    → VectorMergeSegmentBuilder (new merge path)
+```java
+var sourcesForMerge = segments.isEmpty() ? collectMergeSources() : null;
+if (CompactionGraphMerger.ENABLED
+    && sourcesForMerge != null
+    && sourcesForMerge.size() >= 2
+    && V5OnDiskFormat.writeV5VectorPostings(indexContext.version()))
+{
+    → VectorMergeSegmentBuilder
+}
 else if (pqi != null && V3OnDiskFormat.ENABLE_LTM_CONSTRUCTION)
+{
     → VectorOffHeapSegmentBuilder (existing fine-tune path)
+}
 else
+{
     → VectorOnHeapSegmentBuilder (build from scratch)
+}
 ```
 
-**`mergePathApplicable` conditions:**
-- `inputSSTables != null` (compaction operation, not flush)
-- At least 2 source graph segments exist across input SSTables
-- V5 format is in use (`V5OnDiskFormat.writeV5VectorPostings` returns true)
-- **All** source graphs have `INLINE_VECTORS` — if any source lacks it (e.g. NVQ
-  sources have `NVQ_VECTORS` only), `collectMergeSources()` returns `null` and
-  the whole job falls back to the rebuild path
+`collectMergeSources()` returns `null` (triggering fallback) if:
+- `inputSSTables` is null or empty (flush, not compaction)
+- Any source segment's searcher is not a `V2VectorIndexSearcher`
+- Any source graph lacks `INLINE_VECTORS` (e.g. NVQ sources)
+- No source segments are found at all
 
-**Why NVQ sources fall back to rebuild:** `OnDiskGraphIndexCompactor.validateFeatures()`
-hard-requires the `INLINE_VECTORS` feature on every source graph and throws
-`IllegalArgumentException` if it is absent. NVQ graphs are written with
-`NVQ_VECTORS` only (no `INLINE_VECTORS`), so passing them to the compactor
-would crash. `CompactionGraphMerger.merge()` also validates this upfront and
-throws `IllegalStateException` — but the check in `collectMergeSources()` catches
-it earlier so the fallback is clean.
-
-Only inline-vector source graphs are handled by the merge path:
-- **`INLINE_VECTORS` only** (current Cassandra write path): dead-node detection
-  reads the full-precision vector per node and checks `postingsMap.containsKey(vec)`.
-  PQ component written with `CompressionType.NONE`.
-- **`INLINE_VECTORS` + `FUSED_PQ`** (next release): same dead-node detection.
-  Retrained PQ codebook extracted from compacted graph and written to PQ component.
-
-`termsFileHasContent` guards against the compactor overwriting an earlier segment
-if the merge path is invoked for a second segment (which shouldn't happen given
-`requiresFlush()=false`, but is a safety check).
+`segments.isEmpty()` ensures the merge path is only attempted for the first
+output segment. If a second builder is ever requested, `sourcesForMerge` is
+null and the normal off-heap or on-heap path is used instead.
 
 ---
 
 ### 5. `SSTableIndexWriter` — Thread input SSTables through
 **File:** `src/java/org/apache/cassandra/index/sai/disk/v1/SSTableIndexWriter.java`
+**Status: Implemented.**
 
-Add `@Nullable Set<SSTableReader> inputSSTables` as an optional constructor
-parameter (null for flush/rebuild, non-null for compaction). This is used inside
-`newSegmentBuilder()` to filter `indexContext.getView().getIndexes()` to only the
-SSTables being compacted.
+`@Nullable Set<SSTableReader> inputSSTables` added as a constructor parameter
+(null for flush/rebuild, non-null for compaction). Used inside
+`collectMergeSources()` to filter `indexContext.getView().getIndexes()` to only
+the SSTables being compacted.
 
 ---
 
 ### 6. `V1OnDiskFormat.newPerIndexWriter()` — Extract input SSTables
 **File:** `src/java/org/apache/cassandra/index/sai/disk/v1/V1OnDiskFormat.java`
+**Status: Implemented.**
 
-When creating `SSTableIndexWriter` for a compaction operation, cast
-`LifecycleNewTracker` to `LifecycleTransaction` (safe for compaction) and call
-`originals()` to get the input SSTables:
+`inputSSTables` is extracted from the `LifecycleTransaction` and passed to
+`SSTableIndexWriter`. The guard checks both operation type and tracker type:
 
 ```java
-Set<SSTableReader> inputSSTables = (tracker instanceof LifecycleTransaction)
+Set<SSTableReader> inputSSTables =
+    tracker.opType() == OperationType.COMPACTION && tracker instanceof LifecycleTransaction
     ? ((LifecycleTransaction) tracker).originals()
     : null;
 return new SSTableIndexWriter(perIndexComponents, limiter, ..., inputSSTables);
 ```
 
+The `opType() == COMPACTION` check ensures that other `LifecycleTransaction`
+uses (e.g. cleanup, scrub) do not incorrectly enable the merge path.
+
 ---
 
 ### 7. `V5VectorPostingsWriter` — Null-safe postings lookup
 **File:** `src/java/org/apache/cassandra/index/sai/disk/v5/V5VectorPostingsWriter.java`
+**Status: Implemented.**
 
-In `writeGenericOrdinalToRowIdMapping()` and `writeGenericRowIdMapping()`, add
-null handling for the `postingsMap.get(vector)` call. For the merge path, source
-graph nodes whose rows were all deleted have no entry in the postingsMap; they
-should produce an empty posting list (the node exists in the graph but is
-invisible to queries).
+`writeGenericOrdinalToRowIdMapping()` and `writeGenericRowIdMapping()` both
+null-check the result of `postingsMap.get(vector)`. A null result means the
+source graph node had all its rows deleted and was excluded from the
+postings map during Phase 1. In `writeGenericOrdinalToRowIdMapping()`, a null
+posting contributes a size of 0; in `writeGenericRowIdMapping()`, a null posting
+causes the ordinal to be skipped entirely. The node remains in the graph for
+connectivity but is invisible to queries.
 
 ---
 
 ## Implementation Order
 
-1. `CassandraDiskAnn.java` — add accessors (prerequisite for all else)
-2. `CompactionGraphMerger.java` — new class
-3. `VectorMergeSegmentBuilder` — add to `SegmentBuilder.java`
-4. `SSTableIndexWriter.java` — thread input SSTables, add merge path branch
-5. `V1OnDiskFormat.java` — extract originals from `LifecycleTransaction`
-6. `V5VectorPostingsWriter.java` — null-safe postings
+All items completed:
+
+1. `CassandraDiskAnn.java` — accessors added ✓
+2. `CompactionGraphMerger.java` — implemented ✓
+3. `VectorMergeSegmentBuilder` in `SegmentBuilder.java` — implemented ✓
+4. `SSTableIndexWriter.java` — input SSTables threaded through, merge path branch added ✓
+5. `V1OnDiskFormat.java` — originals extracted from `LifecycleTransaction` ✓
+6. `V5VectorPostingsWriter.java` — null-safe postings implemented ✓
 
 ---
 
