@@ -337,7 +337,10 @@ public abstract class SegmentBuilder
         {
             if (graphIndex.isEmpty())
                 return;
+            long start = System.nanoTime();
             var componentsMetadata = graphIndex.flush();
+            logger.info("VectorOffHeapSegmentBuilder: legacy off-heap graph flush {} rows in {}ms for {}",
+                        getRowCount(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), components.descriptor());
             metadataBuilder.setComponentsMetadata(componentsMetadata);
         }
 
@@ -577,7 +580,10 @@ public abstract class SegmentBuilder
             // there are no deletes to worry about when building the index during compaction,
             // and SegmentBuilder::flush checks for the empty index case before calling flushInternal
             assert shouldFlush;
+            long start = System.nanoTime();
             var componentsMetadata = graphIndex.flush(components);
+            logger.info("VectorOnHeapSegmentBuilder: legacy on-heap graph flush {} rows in {}ms for {}",
+                        getRowCount(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), components.descriptor());
             metadataBuilder.setComponentsMetadata(componentsMetadata);
         }
 

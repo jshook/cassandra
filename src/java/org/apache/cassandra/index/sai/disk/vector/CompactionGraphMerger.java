@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -243,7 +244,9 @@ public class CompactionGraphMerger
                         remappers,
                         similarityFunction,
                         compactionFjp);
+                long compactStart = System.nanoTime();
                 compactor.compact(tempGraphPath);
+                long compactMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - compactStart);
                 termsLength = Files.size(tempGraphPath);
 
                 // When FUSED_PQ is in use, the compactor retrains the PQ codebook and embeds it
@@ -258,8 +261,8 @@ public class CompactionGraphMerger
                     }
                 }
 
-                logger.info("CompactionGraphMerger: merging {} source segments ({} surviving ordinals), raw graph {} bytes",
-                            sources.size(), totalGlobalOrdinals, termsLength);
+                logger.info("CompactionGraphMerger: jvector compact() {} source segments ({} surviving ordinals), raw graph {} bytes in {}ms",
+                            sources.size(), totalGlobalOrdinals, termsLength, compactMs);
 
                 try (var termsOutput = termsComponent.openOutput(true))
                 {
