@@ -520,6 +520,7 @@ public abstract class SegmentBuilder
     public static class VectorOnHeapSegmentBuilder extends SegmentBuilder
     {
         private final CassandraOnHeapGraph<Integer> graphIndex;
+        private long buildStart = -1;
 
         public VectorOnHeapSegmentBuilder(IndexComponents.ForWrite components, long rowIdOffset, long keyCount, NamedMemoryLimiter limiter)
         {
@@ -539,6 +540,8 @@ public abstract class SegmentBuilder
         protected long addInternal(List<ByteBuffer> terms, int segmentRowId)
         {
             assert terms.size() == 1;
+            if (buildStart == -1)
+                buildStart = System.nanoTime();
             return graphIndex.add(terms.get(0), segmentRowId);
         }
 
@@ -580,10 +583,9 @@ public abstract class SegmentBuilder
             // there are no deletes to worry about when building the index during compaction,
             // and SegmentBuilder::flush checks for the empty index case before calling flushInternal
             assert shouldFlush;
-            long start = System.nanoTime();
             var componentsMetadata = graphIndex.flush(components);
-            logger.info("VectorOnHeapSegmentBuilder: legacy on-heap graph flush {} rows in {}ms for {}",
-                        getRowCount(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), components.descriptor());
+            logger.info("VectorOnHeapSegmentBuilder: legacy on-heap graph build+flush {} rows in {}ms for {}",
+                        getRowCount(), buildStart == -1 ? 0 : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - buildStart), components.descriptor());
             metadataBuilder.setComponentsMetadata(componentsMetadata);
         }
 
