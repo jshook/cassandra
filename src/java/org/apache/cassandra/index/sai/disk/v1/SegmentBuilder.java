@@ -250,6 +250,7 @@ public abstract class SegmentBuilder
     public static class VectorOffHeapSegmentBuilder extends SegmentBuilder
     {
         private final CompactionGraph graphIndex;
+        private long buildStart = -1;
 
         public VectorOffHeapSegmentBuilder(IndexComponents.ForWrite components,
                                            long rowIdOffset,
@@ -292,6 +293,8 @@ public abstract class SegmentBuilder
             // CompactionGraph splits adding a node into two parts:
             // (1) maybeAddVector, which must be done serially because it writes to disk incrementally
             // (2) addGraphNode, which may be done asynchronously
+            if (buildStart == -1)
+                buildStart = System.nanoTime();
             CompactionGraph.InsertionResult result;
             try
             {
@@ -337,10 +340,9 @@ public abstract class SegmentBuilder
         {
             if (graphIndex.isEmpty())
                 return;
-            long start = System.nanoTime();
             var componentsMetadata = graphIndex.flush();
-            logger.info("VectorOffHeapSegmentBuilder: legacy off-heap graph flush {} rows in {}ms for {}",
-                        getRowCount(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start), components.descriptor());
+            logger.info("VectorOffHeapSegmentBuilder: legacy off-heap graph build+flush {} rows in {}ms for {}",
+                        getRowCount(), buildStart == -1 ? 0 : TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - buildStart), components.descriptor());
             metadataBuilder.setComponentsMetadata(componentsMetadata);
         }
 
