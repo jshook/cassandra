@@ -575,7 +575,7 @@ public class CompactionGraphMergerTest
 
         Path mergedPath = tempDir.resolve("merged_graph");
         long mergeStart = System.nanoTime();
-        new OnDiskGraphIndexCompactor(sourceGraphs, liveNodes, remappers, vsf, fjp)
+        new OnDiskGraphIndexCompactor(sourceGraphs, liveNodes, remappers, vsf, fjp, -1) // -1 = derive taskWindowSize from the pool
                 .compact(mergedPath);
         long mergeMs = (System.nanoTime() - mergeStart) / 1_000_000;
 

@@ -52,6 +52,12 @@ public class IndexMetrics extends AbstractMetrics
     public final Histogram compactionSegmentCellsPerSecond;
     public final Histogram compactionSegmentBytesPerSecond;
 
+    /** On-disk vector graph merge (jvector compaction) measurements, per merge invocation. */
+    public final Counter vectorMergeCount;
+    public final Histogram vectorMergeMillis;
+    public final Histogram vectorMergeBytesWritten;
+    public final Histogram vectorMergeSurvivingOrdinals;
+
     public IndexMetrics(IndexContext context)
     {
         super(context.getKeyspace(), context.getTable(), context.getIndexName(), "IndexMetrics");
@@ -63,6 +69,10 @@ public class IndexMetrics extends AbstractMetrics
         compactionSegmentBytesPerSecond = Metrics.histogram(createMetricName("CompactionSegmentBytesPerSecond"), false);
         memtableFlushCellsPerSecond = Metrics.histogram(createMetricName("MemtableIndexFlushCellsPerSecond"), false);
         segmentsPerCompaction = Metrics.histogram(createMetricName("SegmentsPerCompaction"), false);
+        vectorMergeCount = Metrics.counter(createMetricName("VectorMergeCount"));
+        vectorMergeMillis = Metrics.histogram(createMetricName("VectorMergeMillis"), false);
+        vectorMergeBytesWritten = Metrics.histogram(createMetricName("VectorMergeBytesWritten"), false);
+        vectorMergeSurvivingOrdinals = Metrics.histogram(createMetricName("VectorMergeSurvivingOrdinals"), false);
         ssTableCellCount = Metrics.register(createMetricName("SSTableCellCount"), context::getCellCount);
         memtableIndexFlushCount = Metrics.counter(createMetricName("MemtableIndexFlushCount"));
         compactionCount = Metrics.counter(createMetricName("CompactionCount"));

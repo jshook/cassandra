@@ -487,8 +487,49 @@ public abstract class SegmentBuilder
         {
             if (postingsMap.isEmpty())
                 return;
-            var componentsMetadata = merger.merge(postingsMap, maxSegmentRowId);
-            metadataBuilder.setComponentsMetadata(componentsMetadata);
+
+            long total = Math.max(1L, postingsMap.size());
+            org.apache.cassandra.index.sai.disk.vector.VectorMergeOperation op =
+                    new org.apache.cassandra.index.sai.disk.vector.VectorMergeOperation(
+                            components.context().columnFamilyStore().metadata(),
+                            org.apache.cassandra.utils.UUIDGen.getTimeUUID(),
+                            java.util.Collections.emptyList(),
+                            total);
+
+            // The merge runs on this compaction thread (jvector caller-runs executor), so the number
+            // of concurrent merges is already bounded by concurrent_compactors — no separate pool or
+            // gate is needed. Registering the operation makes the merge visible in nodetool
+            // compactionstats / system_views.sstable_tasks while it runs (it otherwise runs after the
+            // parent compaction already reads 100%).
+
+            // Charge the merge's estimated working set against the SAI segment-build memory limiter so
+            // it participates in the same shared memory budget as ordinary segment builds; the merge
+            // otherwise charges nothing, making its memory invisible to admission/backpressure.
+            long memoryEstimate = total * org.apache.cassandra.config.CassandraRelevantProperties
+                    .SAI_VECTOR_COMPACTION_MERGE_BYTES_PER_ORDINAL.getInt();
+            org.apache.cassandra.index.sai.utils.NamedMemoryLimiter memLimiter =
+                    org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER;
+            memLimiter.increment(memoryEstimate);
+            logger.debug("Vector graph merge measurement: charged {} bytes to SAI segment-build limiter ({} of {} bytes used)",
+                         memoryEstimate, memLimiter.currentBytesUsed(), memLimiter.limitBytes());
+            if (memLimiter.usageExceedsLimit())
+                logger.warn("Vector graph merge estimated {} bytes pushes SAI segment-build memory to {} over the {} byte limit; proceeding",
+                            memoryEstimate, memLimiter.currentBytesUsed(), memLimiter.limitBytes());
+
+            try (org.apache.cassandra.utils.NonThrowingCloseable c =
+                         org.apache.cassandra.db.compaction.CompactionManager.instance.active.onOperationStart(op))
+            {
+                var componentsMetadata = merger.merge(postingsMap, maxSegmentRowId,
+                        new org.apache.cassandra.index.sai.disk.vector.CompactionProgressLimiter(op));
+                op.setCompleted(total);
+                metadataBuilder.setComponentsMetadata(componentsMetadata);
+            }
+            finally
+            {
+                memLimiter.decrement(memoryEstimate);
+                logger.debug("Vector graph merge measurement: released {} bytes from SAI segment-build limiter ({} bytes used)",
+                             memoryEstimate, memLimiter.currentBytesUsed());
+            }
         }
 
         @Override

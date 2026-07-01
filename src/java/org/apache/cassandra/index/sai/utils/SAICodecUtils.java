@@ -19,6 +19,12 @@ package org.apache.cassandra.index.sai.utils;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.zip.CRC32;
 
 import io.github.jbellis.jvector.disk.RandomAccessWriter;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -87,6 +93,67 @@ public class SAICodecUtils
         writeBEInt(out, FOOTER_MAGIC);
         writeBEInt(out, 0);
         writeBELong(out, checksum);
+    }
+
+    /**
+     * Writes the SAI codec footer for a component whose header and body were written out of band — for
+     * example when jvector writes a compacted graph body directly into the component file, bypassing the
+     * checksum-accumulating {@link IndexOutput} used by the streaming write path.
+     *
+     * <p>Appends {@code FOOTER_MAGIC} + algorithmId {@code 0} at {@code bodyEndOffset}, then a CRC-32
+     * computed over {@code [0, bodyEndOffset + 8)} — i.e. header + body + {@code FOOTER_MAGIC} + {@code 0}.
+     * That coverage is exactly what {@link CodecUtil#checksumEntireFile}/{@link #validateChecksum}
+     * validate on read (the checksum spans everything before the trailing 8-byte CRC, which includes the
+     * footer magic and algorithmId), so a component finalized this way passes SAI scrub validation.
+     *
+     * @param file          the component file, already containing the SAI header at {@code [0, headerSize())}
+     *                      and the body at {@code [headerSize(), bodyEndOffset)}
+     * @param bodyEndOffset absolute offset just past the body (= {@link #headerSize()} + body length);
+     *                      the 16-byte footer is written starting here
+     */
+    public static void writeFooterForExternalBody(Path file, long bodyEndOffset) throws IOException
+    {
+        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE))
+        {
+            // FOOTER_MAGIC + algorithmId(0), big-endian (matching writeBEInt), at bodyEndOffset.
+            ByteBuffer prefix = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
+            prefix.putInt(FOOTER_MAGIC).putInt(0).flip();
+            writeFully(ch, prefix, bodyEndOffset);
+
+            // CRC-32 over [0, bodyEndOffset + 8): header + body + FOOTER_MAGIC + 0.
+            CRC32 crc = new CRC32();
+            ByteBuffer buf = ByteBuffer.allocate(1 << 16);
+            long crcEnd = bodyEndOffset + 8;
+            long pos = 0;
+            while (pos < crcEnd)
+            {
+                buf.clear();
+                buf.limit((int) Math.min(buf.capacity(), crcEnd - pos));
+                int n = ch.read(buf, pos);
+                if (n < 0)
+                    throw new IOException("Unexpected EOF at " + pos + " while checksumming footer of " + file);
+                buf.flip();
+                crc.update(buf);
+                pos += n;
+            }
+            long checksum = crc.getValue();
+            if ((checksum & 0xFFFFFFFF00000000L) != 0)
+                throw new IllegalStateException("Illegal CRC-32 checksum: " + checksum + " (resource=" + file + ')');
+
+            // The CRC-32 value, big-endian (matching writeBELong), at bodyEndOffset + 8.
+            ByteBuffer crcBuf = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN);
+            crcBuf.putLong(checksum).flip();
+            writeFully(ch, crcBuf, bodyEndOffset + 8);
+
+            ch.force(true);
+        }
+    }
+
+    private static void writeFully(FileChannel ch, ByteBuffer buf, long position) throws IOException
+    {
+        long p = position;
+        while (buf.hasRemaining())
+            p += ch.write(buf, p);
     }
 
     public static Version checkHeader(DataInput in) throws IOException

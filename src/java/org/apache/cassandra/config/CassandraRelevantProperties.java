@@ -479,6 +479,10 @@ public enum CassandraRelevantProperties
     // source segments to have inline vectors and PQ compression. Set to false to fall back to
     // the legacy rebuild path without restarting (takes effect on the next compaction).
     SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED("cassandra.sai.vector.graph_compaction_merge_enabled", "true"),
+    // Estimated on-heap working-set bytes per surviving ordinal for a vector graph merge, charged
+    // against the SAI segment-build memory limiter so the merge participates in the shared memory
+    // budget. Tune against the vectorMergePeak* measurements once available.
+    SAI_VECTOR_COMPACTION_MERGE_BYTES_PER_ORDINAL("cassandra.sai.vector.compaction_merge_bytes_per_ordinal", "128"),
 
     /**
      * Whether to disable auto-compaction

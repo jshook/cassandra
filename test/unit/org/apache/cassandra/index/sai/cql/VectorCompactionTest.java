@@ -131,6 +131,63 @@ abstract public class VectorCompactionTest extends VectorTester
         assertRowCount(execute("SELECT * FROM %s ORDER BY v ANN OF ? LIMIT 1", randomVectorBoxed(dimension())), 1);
     }
 
+    /**
+     * The vector graph merge writes jvector's compacted graph body directly into the TERMS_DATA
+     * component and hand-computes the SAI footer CRC over the in-place bytes (no temp-file copy).
+     * This exercises that path end to end: build a multi-segment vector index, compact it (which
+     * merges the per-sstable segments via {@code CompactionGraphMerger}), then validate every SAI
+     * component's checksum — which fails if the hand-computed footer CRC is wrong — and confirm ANN
+     * queries still return correctly ordered results.
+     */
+    @Test
+    public void testCompactionMergeProducesValidTermsDataAndQueries()
+    {
+        var indexName = createTableAndReturnIndexName();
+        disableCompaction();
+
+        // Enough rows (>= MIN_PQ_ROWS so PQ is built, exercising the FusedPQ codebook read-back from
+        // the in-place body offset), flushed several times, to produce multiple per-sstable vector
+        // segments so the subsequent compaction takes the merge path rather than a single-segment build.
+        int rowsPerFlush = Math.max(MIN_PQ_ROWS, 256);
+        int flushes = 3;
+        int pk = 0;
+        for (int f = 0; f < flushes; f++)
+        {
+            for (int i = 0; i < rowsPerFlush; i++)
+                execute("INSERT INTO %s (pk, v) VALUES (?, ?)", pk++, randomVectorBoxed(dimension()));
+            flush();
+        }
+
+        var cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());
+        assertTrue("expected multiple sstables before compaction", cfs.getLiveSSTables().size() >= flushes);
+
+        // Compaction merges the per-sstable vector segments; the no-copy write path has jvector write
+        // the merged graph directly into TERMS_DATA and we hand-compute its footer CRC in place.
+        compact();
+        assertEquals("compaction should leave a single sstable", 1, cfs.getLiveSSTables().size());
+
+        // Validate every SAI component checksum for the merged index. validateComponents(..., true)
+        // recomputes TERMS_DATA's CRC over [0, len-8) and compares it to the stored footer CRC, so a
+        // wrong hand-computed no-copy footer fails here.
+        assertTrue("merged TERMS_DATA failed SAI component checksum validation",
+                   verifyChecksum(getIndexContext(indexName)));
+
+        // ANN query round-trip: results must be well-formed and ordered by descending similarity.
+        for (int i = 0; i < 5; i++)
+        {
+            var q = randomVectorBoxed(dimension());
+            var rows = execute("SELECT pk, similarity_cosine(v, ?) AS similarity FROM %s ORDER BY v ANN OF ? LIMIT 10", q, q);
+            assertEquals(10, rows.size());
+            float last = Float.MAX_VALUE;
+            for (var row : rows)
+            {
+                float similarity = row.getFloat("similarity");
+                assertTrue("ANN results not ordered by descending similarity", similarity <= last);
+                last = similarity;
+            }
+        }
+    }
+
     @Test
     public void testPQRefine()
     {

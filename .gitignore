@@ -1,4 +1,6 @@
 .gitignore
+links/
+local/
 
 # C*
 build

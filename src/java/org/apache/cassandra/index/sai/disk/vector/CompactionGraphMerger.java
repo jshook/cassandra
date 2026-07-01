@@ -19,14 +19,12 @@
 package org.apache.cassandra.index.sai.disk.vector;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -41,6 +39,7 @@ import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
 import io.github.jbellis.jvector.util.FixedBitSet;
+import io.github.jbellis.jvector.util.work.ProgressLimiter;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import net.openhft.chronicle.map.ChronicleMap;
@@ -53,7 +52,6 @@ import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.RemappedPos
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.Structure;
 import org.apache.cassandra.index.sai.disk.vector.VectorCompression.CompressionType;
 import org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings;
-import org.apache.cassandra.index.sai.utils.LowPriorityThreadFactory;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -87,15 +85,6 @@ public class CompactionGraphMerger
 
     /** Killswitch: set to false to fall back to the legacy graph-rebuild path without restarting. */
     public static volatile boolean ENABLED = CassandraRelevantProperties.SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED.getBoolean();
-
-    private static final ForkJoinPool compactionFjp = new ForkJoinPool(
-            Runtime.getRuntime().availableProcessors(),
-            new LowPriorityThreadFactory(),
-            null,
-            false);
-
-    /** Copy buffer size when streaming the raw graph into the SAI-wrapped TERMS_DATA file. */
-    private static final int COPY_BUFFER_SIZE = 1 << 20; // 1 MiB
 
     /**
      * One input segment for the merge. The {@link CassandraDiskAnn} provides the on-disk graph
@@ -175,6 +164,21 @@ public class CompactionGraphMerger
             ChronicleMap<VectorFloat<?>, CompactionVectorPostings> postingsMap,
             int maxSegmentRowId) throws IOException
     {
+        return merge(postingsMap, maxSegmentRowId, ProgressLimiter.UNLIMITED);
+    }
+
+    /**
+     * As {@link #merge(ChronicleMap, int)}, but installs a {@link ProgressLimiter} on the jvector
+     * compactor so the host can observe per-phase progress and throttle the merge's write bandwidth.
+     *
+     * @param progressLimiter the control surface to install; pass {@link ProgressLimiter#UNLIMITED}
+     *                        for none (the behaviour of the two-argument overload)
+     */
+    public SegmentMetadata.ComponentMetadataMap merge(
+            ChronicleMap<VectorFloat<?>, CompactionVectorPostings> postingsMap,
+            int maxSegmentRowId,
+            ProgressLimiter progressLimiter) throws IOException
+    {
         // --- Validate source feature sets ---
         boolean hasFusedPQ = validateFeatureSets(sources.stream().map(SourceSegment::graph).collect(toList()));
 
@@ -227,65 +231,65 @@ public class CompactionGraphMerger
 
         try  // outer try: closes source graph views
         {
-            // --- Step 2: Run the jvector compactor to a temp file, then wrap with SAI header/footer ---
+            // --- Step 2: jvector writes the compacted graph body directly into the SAI TERMS_DATA
+            // component, after a reserved SAI header; the footer CRC is then computed over the in-place
+            // header+body. No temp file, one write of the (potentially large) graph.
             var termsComponent = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA);
-            Path termsParentDir = termsComponent.file().toJavaIOFile().toPath().getParent();
-            Path tempGraphPath = Files.createTempFile(termsParentDir, "jvec_compact_", ".tmp");
+            Path termsFile = termsComponent.file().toJavaIOFile().toPath();
 
-            long termsOffset;
-            long termsLength;
+            var compactor = new OnDiskGraphIndexCompactor(
+                    sources.stream().map(SourceSegment::graph).collect(toList()),
+                    liveNodes,
+                    remappers,
+                    similarityFunction,
+                    // Caller-runs executor: the merge's batch work executes on this compaction thread
+                    // rather than a separate jvector-owned pool. Merge parallelism comes from
+                    // concurrent_compactors running multiple compactions, matching Cassandra's
+                    // one-thread-per-compaction model.
+                    Runnable::run,
+                    1); // one batch in-flight (serial on the caller thread)
+            // Install the host control surface: forwards jvector's per-phase progress to the merge
+            // operation and admits its write bandwidth against the shared compaction throughput budget.
+            compactor.setProgressLimiter(progressLimiter);
+
+            // Reserve the SAI header, then have jvector write its body directly after it (compact
+            // preserves [0, startOffset)); finally wrap with a footer whose CRC covers header+body.
+            try (var termsOutput = termsComponent.openOutput(true))
+            {
+                SAICodecUtils.writeHeader(termsOutput);
+            }
+            long termsOffset = SAICodecUtils.headerSize();
+
+            long compactStart = System.nanoTime();
+            compactor.compact(termsFile, termsOffset);
+            long compactMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - compactStart);
+            long termsLength = Files.size(termsFile) - termsOffset;
+
+            // When FUSED_PQ is in use, the compactor retrains the PQ codebook and embeds it in the
+            // output graph. Read it back (from the in-place body offset) so the Cassandra PQ component
+            // holds the same codebook used for in-graph compressed neighbor scoring.
             ProductQuantization retrainedPQ = null;
-
-            try
+            if (hasFusedPQ)
             {
-                var compactor = new OnDiskGraphIndexCompactor(
-                        sources.stream().map(SourceSegment::graph).collect(toList()),
-                        liveNodes,
-                        remappers,
-                        similarityFunction,
-                        compactionFjp);
-                long compactStart = System.nanoTime();
-                compactor.compact(tempGraphPath);
-                long compactMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - compactStart);
-                termsLength = Files.size(tempGraphPath);
-
-                // When FUSED_PQ is in use, the compactor retrains the PQ codebook and embeds it
-                // in the output graph. Read it back so the Cassandra PQ component holds the same
-                // codebook used for in-graph compressed neighbor scoring.
-                if (hasFusedPQ)
+                try (var rs = ReaderSupplierFactory.open(termsFile))
                 {
-                    try (var rs = ReaderSupplierFactory.open(tempGraphPath))
-                    {
-                        var compactedGraph = OnDiskGraphIndex.load(rs);
-                        retrainedPQ = ((FusedPQ) compactedGraph.getFeatures().get(FeatureId.FUSED_PQ)).getPQ();
-                    }
+                    var compactedGraph = OnDiskGraphIndex.load(rs, termsOffset);
+                    retrainedPQ = ((FusedPQ) compactedGraph.getFeatures().get(FeatureId.FUSED_PQ)).getPQ();
                 }
-
-                logger.info("CompactionGraphMerger: jvector compact() {} source segments ({} surviving ordinals), raw graph {} bytes in {}ms",
-                            sources.size(), totalGlobalOrdinals, termsLength, compactMs);
-
-                try (var termsOutput = termsComponent.openOutput(true))
-                {
-                    SAICodecUtils.writeHeader(termsOutput);
-                    termsOffset = termsOutput.getFilePointer(); // = SAICodecUtils.headerSize()
-
-                    byte[] copyBuf = new byte[COPY_BUFFER_SIZE];
-                    try (InputStream rawIn = Files.newInputStream(tempGraphPath))
-                    {
-                        int bytesRead;
-                        while ((bytesRead = rawIn.read(copyBuf)) != -1)
-                            termsOutput.writeBytes(copyBuf, 0, bytesRead);
-                    }
-
-                    SAICodecUtils.writeFooter(termsOutput);
-                }
-                logger.info("CompactionGraphMerger: TERMS_DATA written with SAI header/footer ({} bytes raw graph at offset {})",
-                            termsLength, termsOffset);
             }
-            finally
-            {
-                Files.deleteIfExists(tempGraphPath);
-            }
+
+            SAICodecUtils.writeFooterForExternalBody(termsFile, termsOffset + termsLength);
+            logger.info("CompactionGraphMerger: TERMS_DATA written in place ({} source segments, {} surviving ordinals, {} bytes body at offset {}) in {}ms",
+                        sources.size(), totalGlobalOrdinals, termsLength, termsOffset, compactMs);
+
+            perIndexComponents.context().getIndexMetrics().ifPresent(m -> {
+                m.vectorMergeCount.inc();
+                m.vectorMergeMillis.update(compactMs);
+                m.vectorMergeBytesWritten.update(termsLength);
+                m.vectorMergeSurvivingOrdinals.update(totalGlobalOrdinals);
+            });
+            logger.debug("CompactionGraphMerger measurement: vectorMergeCount+=1, vectorMergeMillis={}, vectorMergeBytesWritten={}, vectorMergeSurvivingOrdinals={}",
+                         compactMs, termsLength, totalGlobalOrdinals);
 
             // --- Step 3: Write postings and PQ ---
             try (var postingsOutput = perIndexComponents.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true);

@@ -25,6 +25,7 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.index.sai.virtual.IndexesSystemView;
 import org.apache.cassandra.index.sai.virtual.SSTablesSystemView;
 import org.apache.cassandra.index.sai.virtual.SegmentsSystemView;
+import org.apache.cassandra.index.sai.virtual.VectorMergeSystemView;
 import org.apache.cassandra.nodes.virtual.LegacyPeersSystemView;
 import org.apache.cassandra.nodes.virtual.LocalNodeSystemView;
 import org.apache.cassandra.nodes.virtual.PeersSystemView;
@@ -62,7 +63,8 @@ public final class SystemViewsKeyspace extends VirtualKeyspace
                   .add(new LegacyPeersSystemView());
         if (CassandraRelevantProperties.SYSTEM_VIEWS_INCLUDE_ALL.getBoolean()
             || CassandraRelevantProperties.SYSTEM_VIEWS_INCLUDE_INDEXES.getBoolean())
-            tables.add(new IndexesSystemView(VIRTUAL_VIEWS));
+            tables.add(new IndexesSystemView(VIRTUAL_VIEWS))
+                  .add(new VectorMergeSystemView(VIRTUAL_VIEWS));
 
         return tables.build();
     }
