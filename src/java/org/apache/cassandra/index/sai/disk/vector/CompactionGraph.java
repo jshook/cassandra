@@ -27,12 +27,10 @@ import java.util.EnumMap;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.IntFunction;
-import java.util.stream.IntStream;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
@@ -89,7 +87,6 @@ import org.apache.cassandra.index.sai.disk.v5.V5OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.Structure;
 import org.apache.cassandra.index.sai.disk.vector.VectorPostings.CompactionVectorPostings;
-import org.apache.cassandra.index.sai.utils.LowPriorityThreadFactory;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
@@ -102,16 +99,6 @@ public class CompactionGraph implements Closeable, Accountable
 {
     private static final Logger logger = LoggerFactory.getLogger(CompactionGraph.class);
     private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
-
-    private static final ForkJoinPool compactionFjp = new ForkJoinPool(Runtime.getRuntime().availableProcessors(),
-                                                                       new LowPriorityThreadFactory(),
-                                                                       null,
-                                                                       false);
-    // see comments to JVector PhysicalCoreExecutor -- HT tends to cause contention for the SIMD units
-    private static final ForkJoinPool compactionSimdPool = new ForkJoinPool(Runtime.getRuntime().availableProcessors() / 2,
-                                                                            new LowPriorityThreadFactory(),
-                                                                            null,
-                                                                            false);
 
     @VisibleForTesting
     public static int PQ_TRAINING_SIZE = ProductQuantization.MAX_PQ_TRAINING_SET_SIZE;
@@ -216,16 +203,14 @@ public class CompactionGraph implements Closeable, Accountable
             logger.warn("Hierarchical graphs configured but node configured with V3OnDiskFormat.JVECTOR_VERSION {}. " +
                         "Skipping setting for {}", jvectorVersion, indexConfig.getIndexName());
 
-        builder = new GraphIndexBuilder(bsp,
+        builder = JVectorVersionUtil.executionContext().newBuilder(bsp,
                                         dimension,
                                         indexConfig.getAnnMaxDegree(),
                                         indexConfig.getConstructionBeamWidth(),
                                         indexConfig.getNeighborhoodOverflow(1.2f),
                                         indexConfig.getAlpha(dimension > 3 ? 1.2f : 1.4f),
                                         indexConfig.isHierarchyEnabled() && jvectorVersion >= 4,
-                                        true, // We always refine during compaction
-                                        compactionSimdPool,
-                                        compactionFjp);
+                                        true); // We always refine during compaction
 
         termsFile = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA).file();
         termsOffset = (termsFile.exists() ? termsFile.length() : 0)
@@ -246,6 +231,9 @@ public class CompactionGraph implements Closeable, Accountable
                               .withStartOffset(termsOffset)
                               .withParallelWorkerThreads(PARALLEL_ENCODING_WRITING_NUM_THREADS)
                               .withParallelDirectBuffers(PARALLEL_ENCODING_WRITING_USE_DIRECT_BUFFERS)
+                              // IO-bound writes run on the shared context's IO executor (= the build
+                              // pool by default), so they too stay within the Cassandra-managed budget.
+                              .withExecutor(JVectorVersionUtil.executionContext().ioExecutor())
                             : new OnDiskGraphIndexWriter.Builder(graph, path).withStartOffset(termsOffset);
 
         writerBuilder.with(nvq != null ? new NVQ(nvq) : new InlineVectors(dimension))
@@ -345,25 +333,22 @@ public class CompactionGraph implements Closeable, Accountable
                     trainingLock.writeLock().lock();
                     try
                     {
-                        // Fine tune the pq codebook
-                        compressor = ((ProductQuantization) compressor).refine(new ListRandomAccessVectorValues(trainingVectors, dimension));
+                        // Fine tune the pq codebook (on the shared build pool)
+                        compressor = JVectorVersionUtil.executionContext().refinePQ((ProductQuantization) compressor,
+                                                                                    new ListRandomAccessVectorValues(trainingVectors, dimension));
                         trainingVectors.clear(); // don't need these anymore so let GC reclaim if it wants to
 
                         long originalBytesUsed = compressedVectors.ramBytesUsed();
-                        // re-encode the vectors added so far
+                        // re-encode the vectors added so far (on the shared build pool)
                         int encodedVectorCount = compressedVectors.count();
                         compressedVectors = new MutablePQVectors((ProductQuantization) compressor);
-                        compactionFjp.submit(() -> {
-                            IntStream.range(0, encodedVectorCount)
-                                     .parallel()
-                                     .forEach(i -> {
-                                         var v = vectorsByOrdinal.get(i);
-                                         if (v == null)
-                                             compressedVectors.setZero(i);
-                                         else
-                                             compressedVectors.encodeAndSet(i, v);
-                                     });
-                        }).join();
+                        JVectorVersionUtil.executionContext().parallelExecutor().forEachInt(encodedVectorCount, i -> {
+                            var v = vectorsByOrdinal.get(i);
+                            if (v == null)
+                                compressedVectors.setZero(i);
+                            else
+                                compressedVectors.encodeAndSet(i, v);
+                        });
 
                         // Update bytes to account for new encoding. This isn't expected to change, but just
                         // in case it does, we track it here.

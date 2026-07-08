@@ -53,6 +53,7 @@ import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
 import io.github.jbellis.jvector.graph.disk.feature.InlineVectors;
 import io.github.jbellis.jvector.graph.disk.feature.NVQ;
+import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
 import io.github.jbellis.jvector.quantization.CompressedVectors;
 import io.github.jbellis.jvector.quantization.PQVectors;
@@ -179,13 +180,18 @@ public class CassandraOnHeapGraph<T> implements Accountable
             logger.warn("Hierarchical graphs configured but node configured with V3OnDiskFormat.JVECTOR_VERSION {}. " +
                         "Skipping setting for {}", jvectorVersion, indexConfig.getIndexName());
 
-        builder = new GraphIndexBuilder(vectorValues,
-                                        similarityFunction,
+        // Build on the shared, Cassandra-bounded build pool. The RandomAccessVectorValues builder ctor
+        // uses jvector's default all-core pools, so go through a BuildScoreProvider + the execution
+        // context instead. That ctor defaults refineFinalGraph=true, so we pass true explicitly here.
+        var scoreProvider = BuildScoreProvider.randomAccessScoreProvider(vectorValues, similarityFunction);
+        builder = JVectorVersionUtil.executionContext().newBuilder(scoreProvider,
+                                        dimension,
                                         indexConfig.getAnnMaxDegree(),
                                         indexConfig.getConstructionBeamWidth(),
                                         indexConfig.getNeighborhoodOverflow(1.0f), // no overflow means add will be a bit slower but flush will be faster
                                         indexConfig.getAlpha(dimension > 3 ? 1.2f : 2.0f),
-                                        indexConfig.isHierarchyEnabled() && jvectorVersion >= 4);
+                                        indexConfig.isHierarchyEnabled() && jvectorVersion >= 4,
+                                        true);
         searchers = ThreadLocal.withInitial(() -> new GraphSearcherAccessManager(new GraphSearcher(builder.getGraph())));
     }
 
@@ -565,7 +571,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             {
                 // Note: the features implementation expects the pqVectors to be addressable on their old ordinal
                 // index, so we use the original vectorValues as the source without performing any remapping.
-                pqVectors = (PQVectors) compressor.encodeAll(vectorValues);
+                pqVectors = (PQVectors) compressor.encodeAll(vectorValues, JVectorVersionUtil.executionContext().computePool());
             }
             features.put(FeatureId.FUSED_PQ, nodeId -> new FusedPQ.State(view, pqVectors::get, nodeId));
         }
@@ -645,7 +651,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             assert !vectorValues.isValueShared();
             // encode (compress) the vectors to save
             if (compressor != null && !writeFusedPQ)
-                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues));
+                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), JVectorVersionUtil.executionContext().computePool());
         }
 
         var actualType = compressor == null ? CompressionType.NONE : preferredCompression.type;

@@ -483,6 +483,17 @@ public enum CassandraRelevantProperties
     // against the SAI segment-build memory limiter so the merge participates in the shared memory
     // budget. Tune against the vectorMergePeak* measurements once available.
     SAI_VECTOR_COMPACTION_MERGE_BYTES_PER_ORDINAL("cassandra.sai.vector.compaction_merge_bytes_per_ordinal", "128"),
+    // Worker-thread count for the shared jvector graph build/compaction ForkJoinPool that bounds all
+    // vector graph construction, cleanup, PQ/NVQ, merge, and re-encode parallelism to a Cassandra-managed
+    // budget instead of the physical core count. 0 (default) derives the size from concurrent_compactors.
+    // Resolved once when the pool is created (first vector build/compaction).
+    SAI_VECTOR_COMPACTION_BUILD_THREADS("cassandra.sai.vector.compaction_build_threads", "0"),
+    // Node-wide budget (in MiB) for vector-index insert work in flight (queued + running) across all
+    // concurrent segment builds. The per-vector insert fan-out parks its producer (no busy-wait) once
+    // this much estimated insert memory is outstanding, giving designed backpressure instead of an
+    // unbounded executor queue. Capped at ~2 GiB (int permit space). Set to 0 to disable the bound
+    // entirely (unbounded fan-out in both task count and memory).
+    SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB("cassandra.sai.vector.compaction_insert_inflight_mb", "128"),
 
     /**
      * Whether to disable auto-compaction

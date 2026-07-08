@@ -16,13 +16,22 @@
 
 package org.apache.cassandra.index.sai.disk.vector;
 
+import java.util.concurrent.ForkJoinPool;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.github.jbellis.jvector.graph.EmbeddedExecutionContext;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
 import org.apache.cassandra.index.sai.disk.v3.V3OnDiskFormat;
+import org.apache.cassandra.index.sai.utils.BoundedFanout;
+import org.apache.cassandra.index.sai.utils.InsertFanout;
+import org.apache.cassandra.index.sai.utils.LowPriorityThreadFactory;
+import org.apache.cassandra.index.sai.utils.ResizableSemaphore;
+import org.apache.cassandra.index.sai.utils.UnboundedFanout;
 
 public class JVectorVersionUtil
 {
@@ -36,6 +45,194 @@ public class JVectorVersionUtil
     public static volatile boolean ENABLE_FUSED = CassandraRelevantProperties.SAI_VECTOR_ENABLE_FUSED.getBoolean();
     public static volatile boolean ENABLE_NVQ = CassandraRelevantProperties.SAI_VECTOR_ENABLE_NVQ.getBoolean();
     public static final int NUM_SUB_VECTORS = CassandraRelevantProperties.SAI_VECTOR_NVQ_NUM_SUB_VECTORS.getInt();
+
+    /**
+     * A lazily-rebuilt bundle of the shared jvector build/compaction {@link ForkJoinPool} and the
+     * {@link EmbeddedExecutionContext} wired to it, at a fixed worker-thread count.
+     */
+    private static final class BuildPool
+    {
+        final int threads;
+        final ForkJoinPool pool;
+        final EmbeddedExecutionContext context;
+
+        BuildPool(int threads)
+        {
+            this.threads = Math.max(1, threads);
+            // A ForkJoinPool is required: jvector's submit-then-join build pattern is only safe (no
+            // thread-starvation deadlock) on a work-stealing pool, and product quantization needs one.
+            this.pool = new ForkJoinPool(this.threads, new LowPriorityThreadFactory(), null, false);
+            this.context = EmbeddedExecutionContext.of(pool);
+        }
+    }
+
+    /**
+     * The desired worker-thread count for the shared jvector build/compaction pool. Settable at runtime
+     * via {@link #setCompactionBuildThreads(int)}; a change takes effect by lazily rebuilding the pool
+     * before the next compaction that requests the context (in-flight compactions are undisturbed). A
+     * value &lt;= 0 from {@link CassandraRelevantProperties#SAI_VECTOR_COMPACTION_BUILD_THREADS} derives
+     * from {@code concurrent_compactors}.
+     */
+    private static volatile int desiredBuildThreads = resolveCompactionBuildThreads();
+
+    /**
+     * The current build pool + context: a single node-wide, low-priority {@link ForkJoinPool} that bounds
+     * all jvector graph construction, cleanup, PQ/NVQ, merge, and re-encode parallelism to a
+     * Cassandra-managed budget rather than the physical core count, shared by flush, rebuild, and merge.
+     */
+    private static volatile BuildPool buildPool = new BuildPool(desiredBuildThreads);
+    private static final Object buildPoolLock = new Object();
+
+    /**
+     * Returns the current build pool, first lazily replacing it (before the caller's compaction proceeds)
+     * if {@link #desiredBuildThreads} changed since it was built. A {@code ForkJoinPool}'s parallelism
+     * cannot change in place, so a size change installs a fresh pool for subsequent compactions; in-flight
+     * compactions keep the pool they already captured, and the superseded pool's idle worker threads time
+     * out (keepalive) and it is reclaimed once no compaction references it.
+     */
+    private static BuildPool currentBuildPool()
+    {
+        BuildPool p = buildPool;
+        if (p.threads == desiredBuildThreads)
+            return p;
+        synchronized (buildPoolLock)
+        {
+            p = buildPool;
+            if (p.threads != desiredBuildThreads)
+                buildPool = p = new BuildPool(desiredBuildThreads);
+            return p;
+        }
+    }
+
+    /** The shared jvector build/compaction execution context (rebuilt lazily on a thread-count change). */
+    public static EmbeddedExecutionContext executionContext()
+    {
+        return currentBuildPool().context;
+    }
+
+    /** The shared jvector build/compaction {@link ForkJoinPool} backing {@link #executionContext()}. */
+    public static ForkJoinPool compactionBuildPool()
+    {
+        return currentBuildPool().pool;
+    }
+
+    /** The current worker-thread count of the shared build/compaction pool. */
+    public static int compactionBuildThreads()
+    {
+        return currentBuildPool().threads;
+    }
+
+    /** The desired worker-thread count a running compaction will pick up on its next context request. */
+    public static int getDesiredCompactionBuildThreads()
+    {
+        return desiredBuildThreads;
+    }
+
+    /**
+     * Set the desired worker-thread count for the shared build/compaction pool. Takes effect by lazily
+     * replacing the pool before the next compaction that requests the context; in-flight compactions are
+     * undisturbed. A value &lt;= 0 derives from {@code concurrent_compactors}. Not persisted (in-memory,
+     * like a JMX set) — the configured property remains the startup default.
+     */
+    public static void setCompactionBuildThreads(int threads)
+    {
+        int resolved = threads > 0 ? threads : DatabaseDescriptor.getConcurrentCompactors();
+        desiredBuildThreads = Math.max(1, resolved);
+    }
+
+    private static int resolveCompactionBuildThreads()
+    {
+        int configured = CassandraRelevantProperties.SAI_VECTOR_COMPACTION_BUILD_THREADS.getInt();
+        int threads = configured > 0 ? configured : DatabaseDescriptor.getConcurrentCompactors();
+        return Math.max(1, threads);
+    }
+
+    /**
+     * Desired node-wide in-flight insert budget in permits (bytes, capped at ~2 GiB), or {@code 0} to
+     * disable the bound (unbounded fan-out). Settable at runtime via {@link #setInsertInflightMb(int)};
+     * {@link #newInsertFanout()} picks the policy and resizes the shared budget on the next segment build.
+     * See {@link CassandraRelevantProperties#SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB}.
+     */
+    private static volatile int desiredInflightPermits = resolveInsertInflightPermits();
+
+    /**
+     * The shared node-wide insert-admission gate, resized in place when the budget changes (affecting all
+     * bounded fan-outs that share it). Created with the startup budget; in unbounded mode it holds 0
+     * permits and is simply unused.
+     */
+    private static final ResizableSemaphore INSERT_BUDGET = new ResizableSemaphore(Math.max(0, desiredInflightPermits));
+
+    /**
+     * A per-build {@link InsertFanout} over the current build pool. Thread concurrency is bounded by the
+     * pool; the admission policy is chosen live from {@link #desiredInflightPermits} — a
+     * {@link BoundedFanout} gated by the shared (in-place-resized) budget, or an {@link UnboundedFanout}
+     * when the budget is disabled.
+     */
+    public static InsertFanout newInsertFanout()
+    {
+        ForkJoinPool pool = currentBuildPool().pool;
+        int permits = desiredInflightPermits;
+        if (permits <= 0)
+            return new UnboundedFanout(pool);
+        if (INSERT_BUDGET.totalPermits() != permits)
+            INSERT_BUDGET.setTotalPermits(permits);
+        return new BoundedFanout(pool, INSERT_BUDGET, permits);
+    }
+
+    /** The current in-flight insert budget in MiB, or 0 if unbounded. */
+    public static int getInsertInflightMb()
+    {
+        int permits = desiredInflightPermits;
+        return permits <= 0 ? 0 : permits / (1024 * 1024);
+    }
+
+    /**
+     * Set the node-wide in-flight insert budget in MiB, or 0 to disable the bound (unbounded fan-out).
+     * Takes effect on the next segment build; the shared budget is resized in place. Not persisted.
+     */
+    public static void setInsertInflightMb(int mb)
+    {
+        desiredInflightPermits = mb <= 0 ? 0 : (int) Math.min(Integer.MAX_VALUE, (long) mb * 1024L * 1024L);
+    }
+
+    private static int resolveInsertInflightPermits()
+    {
+        int mb = CassandraRelevantProperties.SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB.getInt();
+        if (mb <= 0)
+            return 0; // disabled: unbounded fan-out
+        return (int) Math.min(Integer.MAX_VALUE, (long) mb * 1024L * 1024L);
+    }
+
+    /**
+     * Live per-surviving-ordinal on-heap memory estimate (bytes) charged for a vector graph merge. Read
+     * fresh on each merge, so a change takes effect immediately.
+     */
+    private static volatile int mergeBytesPerOrdinal =
+        CassandraRelevantProperties.SAI_VECTOR_COMPACTION_MERGE_BYTES_PER_ORDINAL.getInt();
+
+    /** The per-surviving-ordinal memory estimate (bytes) charged for a vector graph merge. */
+    public static int getMergeBytesPerOrdinal()
+    {
+        return mergeBytesPerOrdinal;
+    }
+
+    /** Set the per-surviving-ordinal merge memory estimate (bytes); takes effect on the next merge. */
+    public static void setMergeBytesPerOrdinal(int bytes)
+    {
+        mergeBytesPerOrdinal = Math.max(1, bytes);
+    }
+
+    /** Whether vector-index compaction merges existing on-disk graphs (vs. the legacy rebuild path). */
+    public static boolean isGraphCompactionMergeEnabled()
+    {
+        return CompactionGraphMerger.ENABLED;
+    }
+
+    /** Enable/disable the vector graph-compaction merge path; takes effect on the next segment build. */
+    public static void setGraphCompactionMergeEnabled(boolean enabled)
+    {
+        CompactionGraphMerger.ENABLED = enabled;
+    }
 
     /**
      * Decide whether we should write NVQ vectors to disk.
@@ -129,5 +326,16 @@ public class JVectorVersionUtil
                     CassandraRelevantProperties.SAI_VECTOR_GRAPH_COMPACTION_MERGE_ENABLED.getBoolean(),
                     CassandraRelevantProperties.SAI_ENCODE_AND_WRITE_VECTOR_GRAPH_IN_PARALLEL_ENABLED.getKey(),
                     CassandraRelevantProperties.SAI_ENCODE_AND_WRITE_VECTOR_GRAPH_IN_PARALLEL_ENABLED.getBoolean());
+
+        logger.info("JVector graph build/compaction pool: {} worker threads (-D{}={}, 0 => concurrent_compactors={})",
+                    compactionBuildThreads(),
+                    CassandraRelevantProperties.SAI_VECTOR_COMPACTION_BUILD_THREADS.getKey(),
+                    CassandraRelevantProperties.SAI_VECTOR_COMPACTION_BUILD_THREADS.getInt(),
+                    DatabaseDescriptor.getConcurrentCompactors());
+        logger.info("JVector insert fan-out: {} (-D{})",
+                    desiredInflightPermits > 0
+                        ? (getInsertInflightMb() + " MiB in-flight budget (bounded)")
+                        : "unbounded (in-flight budget disabled)",
+                    CassandraRelevantProperties.SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB.getKey());
     }
 }

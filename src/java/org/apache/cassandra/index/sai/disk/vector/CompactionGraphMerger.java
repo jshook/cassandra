@@ -237,17 +237,16 @@ public class CompactionGraphMerger
             var termsComponent = perIndexComponents.addOrGet(IndexComponentType.TERMS_DATA);
             Path termsFile = termsComponent.file().toJavaIOFile().toPath();
 
-            var compactor = new OnDiskGraphIndexCompactor(
+            var compactor = JVectorVersionUtil.executionContext().newCompactor(
                     sources.stream().map(SourceSegment::graph).collect(toList()),
                     liveNodes,
                     remappers,
                     similarityFunction,
-                    // Caller-runs executor: the merge's batch work executes on this compaction thread
-                    // rather than a separate jvector-owned pool. Merge parallelism comes from
-                    // concurrent_compactors running multiple compactions, matching Cassandra's
-                    // one-thread-per-compaction model.
-                    Runnable::run,
-                    1); // one batch in-flight (serial on the caller thread)
+                    // The merge's batch work runs on the shared, Cassandra-bounded build pool
+                    // (JVectorVersionUtil.compactionBuildPool()); allow up to that many batches in flight so
+                    // a single merge can use the pool's parallelism while total jvector build threads stay
+                    // within the managed budget.
+                    JVectorVersionUtil.compactionBuildThreads());
             // Install the host control surface: forwards jvector's per-phase progress to the merge
             // operation and admits its write bandwidth against the shared compaction throughput budget.
             compactor.setProgressLimiter(progressLimiter);

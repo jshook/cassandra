@@ -23,12 +23,8 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
 import java.util.ArrayList;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
@@ -40,8 +36,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.github.jbellis.jvector.quantization.VectorCompressor;
-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
-import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
@@ -59,6 +53,8 @@ import org.apache.cassandra.index.sai.disk.v1.kdtree.NumericIndexWriter;
 import org.apache.cassandra.index.sai.disk.v1.trie.InvertedIndexWriter;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.CompactionGraph;
+import org.apache.cassandra.index.sai.disk.vector.JVectorVersionUtil;
+import org.apache.cassandra.index.sai.utils.InsertFanout;
 import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
@@ -68,7 +64,6 @@ import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.lucene.util.BytesRef;
 
-import static org.apache.cassandra.utils.FBUtilities.busyWaitWhile;
 
 /**
  * Creates an on-heap index data structure to be flushed to an SSTable index.
@@ -82,12 +77,6 @@ public abstract class SegmentBuilder
 {
     private static final Logger logger = LoggerFactory.getLogger(SegmentBuilder.class);
 
-    /** for parallelism within a single compaction */
-    public static final ExecutorService compactionExecutor = new DebuggableThreadPoolExecutor(Runtime.getRuntime().availableProcessors(),
-                                                                                              1,
-                                                                                              TimeUnit.MINUTES,
-                                                                                              new ArrayBlockingQueue<>(10 * Runtime.getRuntime().availableProcessors()),
-                                                                                              new NamedThreadFactory("SegmentBuilder", Thread.MIN_PRIORITY));
 
     // Served as safe net in case memory limit is not triggered or when merger merges small segments..
     public static final long LAST_VALID_SEGMENT_ROW_ID = ((long)Integer.MAX_VALUE / 2) - 1L;
@@ -129,9 +118,9 @@ public abstract class SegmentBuilder
     protected ByteBuffer minTerm;
     protected ByteBuffer maxTerm;
 
-    protected final AtomicInteger updatesInFlight = new AtomicInteger(0);
     protected final QuickSlidingWindowReservoir termSizeReservoir = new QuickSlidingWindowReservoir(100);
-    protected AtomicReference<Throwable> asyncThrowable = new AtomicReference<>();
+    /** Weighted, bounded (or unbounded) async insert fan-out; set by the vector builders, null for synchronous builders. */
+    protected InsertFanout insertFanout;
 
 
     public boolean requiresFlush()
@@ -271,6 +260,7 @@ public abstract class SegmentBuilder
             }
             totalBytesAllocated = graphIndex.ramBytesUsed();
             totalBytesAllocatedConcurrent.add(totalBytesAllocated);
+            insertFanout = JVectorVersionUtil.newInsertFanout();
         }
 
         @Override
@@ -295,6 +285,9 @@ public abstract class SegmentBuilder
             // (2) addGraphNode, which may be done asynchronously
             if (buildStart == -1)
                 buildStart = System.nanoTime();
+            // Weight the in-flight admission by the vector's serialized size (its dominant heap cost),
+            // captured before maybeAddVector may consume the buffer.
+            int weight = terms.get(0).remaining();
             CompactionGraph.InsertionResult result;
             try
             {
@@ -307,32 +300,20 @@ public abstract class SegmentBuilder
             if (result.vector == null)
                 return result.bytesUsed;
 
-            updatesInFlight.incrementAndGet();
-            compactionExecutor.submit(() -> {
-                try
-                {
-                    long bytesAdded = result.bytesUsed + graphIndex.addGraphNode(result);
-                    totalBytesAllocatedConcurrent.add(bytesAdded);
-                    termSizeReservoir.update(bytesAdded);
-                }
-                catch (Throwable th)
-                {
-                    asyncThrowable.compareAndExchange(null, th);
-                }
-                finally
-                {
-                    updatesInFlight.decrementAndGet();
-                }
+            // Dispatch the graph insertion onto the shared build pool via the fan-out harness, which
+            // admits it against the in-flight budget (parking the compaction thread, without spinning,
+            // when the budget is exhausted) rather than relying on an executor queue as the throttle.
+            insertFanout.submit(weight, () -> {
+                long bytesAdded = result.bytesUsed + graphIndex.addGraphNode(result);
+                totalBytesAllocatedConcurrent.add(bytesAdded);
+                termSizeReservoir.update(bytesAdded);
             });
-            // bytes allocated will be approximated immediately as the average of recently added terms,
-            // rather than waiting until the async update completes to get the exact value.  The latter could
-            // result in a dangerously large discrepancy between the amount of memory actually consumed
-            // and the amount the limiter knows about if the queue depth grows.
-            busyWaitWhile(() -> termSizeReservoir.size() == 0 && asyncThrowable.get() == null);
-            if (asyncThrowable.get() != null) {
-                throw new RuntimeException("Error adding term asynchronously", asyncThrowable.get());
-            }
-            return (long) termSizeReservoir.getMean();
+            Throwable async = insertFanout.error();
+            if (async != null)
+                throw new RuntimeException("Error adding term asynchronously", async);
+            // Charge the limiter immediately with an estimate: the running mean once warm, else this
+            // term's weight -- no need to block for the async result now that in-flight memory is bounded.
+            return termSizeReservoir.size() == 0 ? weight : (long) termSizeReservoir.getMean();
         }
 
         @Override
@@ -505,8 +486,7 @@ public abstract class SegmentBuilder
             // Charge the merge's estimated working set against the SAI segment-build memory limiter so
             // it participates in the same shared memory budget as ordinary segment builds; the merge
             // otherwise charges nothing, making its memory invisible to admission/backpressure.
-            long memoryEstimate = total * org.apache.cassandra.config.CassandraRelevantProperties
-                    .SAI_VECTOR_COMPACTION_MERGE_BYTES_PER_ORDINAL.getInt();
+            long memoryEstimate = total * JVectorVersionUtil.getMergeBytesPerOrdinal();
             org.apache.cassandra.index.sai.utils.NamedMemoryLimiter memLimiter =
                     org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER;
             memLimiter.increment(memoryEstimate);
@@ -571,6 +551,7 @@ public abstract class SegmentBuilder
             graphIndex = new CassandraOnHeapGraph<>(components.context(), false, null);
             totalBytesAllocated = graphIndex.ramBytesUsed();
             totalBytesAllocatedConcurrent.add(totalBytesAllocated);
+            insertFanout = JVectorVersionUtil.newInsertFanout();
         }
 
         @Override
@@ -591,32 +572,17 @@ public abstract class SegmentBuilder
         @Override
         protected long addInternalAsync(List<ByteBuffer> terms, int segmentRowId)
         {
-            updatesInFlight.incrementAndGet();
-            compactionExecutor.submit(() -> {
-                try
-                {
-                    long bytesAdded = addInternal(terms, segmentRowId);
-                    totalBytesAllocatedConcurrent.add(bytesAdded);
-                    termSizeReservoir.update(bytesAdded);
-                }
-                catch (Throwable th)
-                {
-                    asyncThrowable.compareAndExchange(null, th);
-                }
-                finally
-                {
-                    updatesInFlight.decrementAndGet();
-                }
+            int weight = terms.get(0).remaining();
+            // Dispatch on the shared build pool, admitted against the in-flight budget (parks, no spin).
+            insertFanout.submit(weight, () -> {
+                long bytesAdded = addInternal(terms, segmentRowId);
+                totalBytesAllocatedConcurrent.add(bytesAdded);
+                termSizeReservoir.update(bytesAdded);
             });
-            // bytes allocated will be approximated immediately as the average of recently added terms,
-            // rather than waiting until the async update completes to get the exact value.  The latter could
-            // result in a dangerously large discrepancy between the amount of memory actually consumed
-            // and the amount the limiter knows about if the queue depth grows.
-            busyWaitWhile(() -> termSizeReservoir.size() == 0 && asyncThrowable.get() == null);
-            if (asyncThrowable.get() != null) {
-                throw new RuntimeException("Error adding term asynchronously", asyncThrowable.get());
-            }
-            return (long) termSizeReservoir.getMean();
+            Throwable async = insertFanout.error();
+            if (async != null)
+                throw new RuntimeException("Error adding term asynchronously", async);
+            return termSizeReservoir.size() == 0 ? weight : (long) termSizeReservoir.getMean();
         }
 
         @Override
@@ -762,14 +728,15 @@ public abstract class SegmentBuilder
 
     public Throwable getAsyncThrowable()
     {
-        return asyncThrowable.get();
+        return insertFanout == null ? null : insertFanout.error();
     }
 
     public void awaitAsyncAdditions()
     {
-        // addTerm is only called by the compaction thread, serially, so we don't need to worry about new
-        // terms being added while we're waiting -- updatesInFlight can only decrease
-        busyWaitWhile(() -> updatesInFlight.get() > 0);
+        // addTerm is only called by the compaction thread, serially, so no new inserts are dispatched
+        // while we drain. Parks (no spin) until every dispatched insert has completed.
+        if (insertFanout != null)
+            insertFanout.awaitCompletion();
     }
 
     long totalBytesAllocated()
