@@ -195,14 +195,30 @@ public class V1OnDiskFormat implements OnDiskFormat
     {
         IndexContext context = index.getIndexContext();
         IndexComponents.ForWrite perIndexComponents = indexDescriptor.newPerIndexComponentsForWrite(context);
-        // If we're not flushing or we haven't yet started the initialization build, flush from SSTable contents.
-        if (tracker.opType() != OperationType.FLUSH || !index.canFlushFromMemtableIndex())
+        OperationType opType = tracker.opType();
+        boolean canFlushFromMemtable = index.canFlushFromMemtableIndex();
+        // A flush of an initialized index serializes the existing memtable index directly (no graph
+        // rebuild); otherwise -- a compaction, or a flush before the memtable index is flushable -- we
+        // (re)build the on-disk index from sstable contents. For vector indexes this fork decides whether
+        // flush stays at memtable-steady-state memory or incurs a full graph rebuild, so it is logged.
+        boolean serializeFromMemtable = opType == OperationType.FLUSH && canFlushFromMemtable;
+
+        if (context.isVector())
+            logger.info("Vector SAI writer selection [{}.{}.{}] op={} canFlushFromMemtableIndex={} -> {}: {}",
+                        context.getKeyspace(), context.getTable(), context.getIndexName(),
+                        opType, canFlushFromMemtable,
+                        serializeFromMemtable ? "MemtableIndexWriter" : "SSTableIndexWriter",
+                        serializeFromMemtable ? "serialize existing on-heap memtable graph (no rebuild)"
+                            : opType == OperationType.FLUSH ? "REBUILD graph from sstable (memtable index not flushable yet)"
+                            : "build graph from sstable inputs");
+
+        if (!serializeFromMemtable)
         {
             NamedMemoryLimiter limiter = SEGMENT_BUILD_MEMORY_LIMITER;
             logger.debug(index.getIndexContext().logMessage("Starting a compaction index build. Global segment memory usage: {}"),
                          prettyPrintMemory(limiter.currentBytesUsed()));
 
-            Set<SSTableReader> inputSSTables = tracker.opType() == OperationType.COMPACTION && tracker instanceof LifecycleTransaction
+            Set<SSTableReader> inputSSTables = opType == OperationType.COMPACTION && tracker instanceof LifecycleTransaction
                                                ? ((LifecycleTransaction) tracker).originals()
                                                : null;
             return new SSTableIndexWriter(perIndexComponents, limiter, index.isDropped(), index.isUnloaded(), keyCount, inputSSTables);
