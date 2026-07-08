@@ -42,6 +42,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.ParallelExecutor;
+import io.github.jbellis.jvector.quantization.KMeansPlusPlusClusterer;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
@@ -123,6 +125,9 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private final ColumnQueryMetrics.VectorIndexMetrics columnQueryMetrics;
     private final ConcurrentVectorValues vectorValues;
     private final GraphIndexBuilder builder;
+    // Executor for this graph's build/cleanup/PQ work: caller-runs for the memtable graph (flush runs on
+    // the flush-writer thread), the bounded shared pool for the compaction rebuild graph.
+    private final ParallelExecutor buildExecutor;
     private final VectorType.VectorSerializer serializer;
     private final VectorSimilarityFunction similarityFunction;
     private final ConcurrentMap<VectorFloat<?>, VectorPostings<T>> postingsMap;
@@ -180,18 +185,26 @@ public class CassandraOnHeapGraph<T> implements Accountable
             logger.warn("Hierarchical graphs configured but node configured with V3OnDiskFormat.JVECTOR_VERSION {}. " +
                         "Skipping setting for {}", jvectorVersion, indexConfig.getIndexName());
 
-        // Build on the shared, Cassandra-bounded build pool. The RandomAccessVectorValues builder ctor
-        // uses jvector's default all-core pools, so go through a BuildScoreProvider + the execution
-        // context instead. That ctor defaults refineFinalGraph=true, so we pass true explicitly here.
+        // The memtable graph (forSearching) is flushed on the memtable flush-writer thread, so run its
+        // build/cleanup/PQ there (caller-runs) instead of on the bounded compaction pool: flush is a
+        // foreground, memory-reclaiming operation that should scale with memtable_flush_writers, isolated
+        // from compaction. The compaction rebuild graph uses the bounded shared pool. (Going through a
+        // BuildScoreProvider because the RandomAccessVectorValues builder ctor uses jvector's all-core
+        // defaults; refineFinalGraph defaults to true there, so we pass true explicitly.)
+        buildExecutor = forSearching
+                        ? ParallelExecutor.callerRuns()
+                        : JVectorVersionUtil.executionContext().parallelExecutor();
         var scoreProvider = BuildScoreProvider.randomAccessScoreProvider(vectorValues, similarityFunction);
-        builder = JVectorVersionUtil.executionContext().newBuilder(scoreProvider,
+        builder = new GraphIndexBuilder(scoreProvider,
                                         dimension,
                                         indexConfig.getAnnMaxDegree(),
                                         indexConfig.getConstructionBeamWidth(),
                                         indexConfig.getNeighborhoodOverflow(1.0f), // no overflow means add will be a bit slower but flush will be faster
                                         indexConfig.getAlpha(dimension > 3 ? 1.2f : 2.0f),
                                         indexConfig.isHierarchyEnabled() && jvectorVersion >= 4,
-                                        true);
+                                        true,
+                                        buildExecutor,
+                                        buildExecutor);
         searchers = ThreadLocal.withInitial(() -> new GraphSearcherAccessManager(new GraphSearcher(builder.getGraph())));
     }
 
@@ -571,7 +584,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             {
                 // Note: the features implementation expects the pqVectors to be addressable on their old ordinal
                 // index, so we use the original vectorValues as the source without performing any remapping.
-                pqVectors = (PQVectors) compressor.encodeAll(vectorValues, JVectorVersionUtil.executionContext().computePool());
+                pqVectors = (PQVectors) compressor.encodeAll(vectorValues, buildExecutor);
             }
             features.put(FeatureId.FUSED_PQ, nodeId -> new FusedPQ.State(view, pqVectors::get, nodeId));
         }
@@ -651,7 +664,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             assert !vectorValues.isValueShared();
             // encode (compress) the vectors to save
             if (compressor != null && !writeFusedPQ)
-                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), JVectorVersionUtil.executionContext().computePool());
+                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), buildExecutor);
         }
 
         var actualType = compressor == null ? CompressionType.NONE : preferredCompression.type;
@@ -693,7 +706,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
             if (vectorValues.size() < MIN_PQ_ROWS)
                 return null;
             else
-                return ProductQuantization.compute(vectorValues, preferredCompression.getCompressedSize(), 256, false);
+                return ProductQuantization.compute(vectorValues, preferredCompression.getCompressedSize(), 256, false,
+                                                   KMeansPlusPlusClusterer.UNWEIGHTED, buildExecutor, buildExecutor);
         }
 
         // use the existing one unmodified if we either don't have enough rows to fine-tune, or
@@ -703,7 +717,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             return existingPQ;
 
         // refine the existing one
-        return existingPQ.refine(vectorValues);
+        return existingPQ.refine(vectorValues, 1, KMeansPlusPlusClusterer.UNWEIGHTED, buildExecutor, buildExecutor);
     }
 
     public long ramBytesUsed()
