@@ -82,6 +82,7 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.INativeLibrary;
 import org.apache.cassandra.utils.JMXServerUtils;
+import org.apache.cassandra.index.sai.disk.vector.JVectorCompactionControl;
 import org.apache.cassandra.index.sai.disk.vector.JVectorVersionUtil;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
@@ -633,6 +634,7 @@ public class CassandraDaemon
             logger.debug("JVM Arguments: {}", ManagementFactory.getRuntimeMXBean().getInputArguments());
 
             JVectorVersionUtil.logStartupConfig();
+            JVectorCompactionControl.registerMBean();
     	}
     }
 
