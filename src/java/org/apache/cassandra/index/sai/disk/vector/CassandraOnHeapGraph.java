@@ -458,7 +458,10 @@ public class CassandraOnHeapGraph<T> implements Accountable
                             postingsMap.keySet().size(), deletedOrdinals.size(), vectorValues.size());
             // remove deleted ordinals from the graph.  this is not done at remove() time, because the same vector
             // could be added back again, "undeleting" the ordinal, and the concurrency gets tricky
-            deletedOrdinals.stream().parallel().forEach(builder::markNodeDeleted);
+            // route through buildExecutor so this respects the build's resource budget:
+            // caller-runs (single-threaded on the flush-writer thread) for a memtable flush, or the
+            // bounded compaction pool for a rebuild -- rather than escaping onto the JVM common pool.
+            buildExecutor.forEach(deletedOrdinals.stream(), builder::markNodeDeleted);
             deletedOrdinals.clear();
             builder.cleanup();
             remappedPostings = V5VectorPostingsWriter.remapForMemtable(postingsMap, perIndexComponents.version());
@@ -575,17 +578,14 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
         if (compressor instanceof ProductQuantization && writeFusedPQ)
         {
-            // This block is an extension of an already present design that limits the PQ computation and encoding
-            // to one index at a time -- goal during flush is to evict from memory ASAP so better to do the PQ build
-            // (in parallel) one at a time. We have https://github.com/riptano/cndb/issues/12110 to encode the
-            // PQ iteratively, but since that isn't implemented, we keep the same, fairly brittle pattern.
-            final PQVectors pqVectors;
-            synchronized (CassandraOnHeapGraph.class)
-            {
-                // Note: the features implementation expects the pqVectors to be addressable on their old ordinal
-                // index, so we use the original vectorValues as the source without performing any remapping.
-                pqVectors = (PQVectors) compressor.encodeAll(vectorValues, buildExecutor);
-            }
+            // Encode the vectors for the fused-PQ feature on buildExecutor -- caller-runs (single-threaded on
+            // the flush-writer thread) for a memtable flush, or the bounded compaction pool for a rebuild.
+            // This is no longer serialized on a node-wide lock; concurrent flushes are bounded by
+            // memtable_flush_writers. https://github.com/riptano/cndb/issues/12110 tracks encoding the PQ
+            // iteratively during ingest so it need not be recomputed here at all.
+            // Note: the features implementation expects the pqVectors to be addressable on their old ordinal
+            // index, so we use the original vectorValues as the source without performing any remapping.
+            PQVectors pqVectors = (PQVectors) compressor.encodeAll(vectorValues, buildExecutor);
             features.put(FeatureId.FUSED_PQ, nodeId -> new FusedPQ.State(view, pqVectors::get, nodeId));
         }
 
@@ -651,21 +651,22 @@ public class CassandraOnHeapGraph<T> implements Accountable
         // Build encoder and compress vectors
         VectorCompressor<?> compressor = null; // will be null if we can't compress
         CompressedVectors cv = null;
-        // limit the PQ computation and encoding to one index at a time -- goal during flush is to
-        // evict from memory ASAP so better to do the PQ build (in parallel) one at a time
-        synchronized (CassandraOnHeapGraph.class)
+        // PQ training and encoding run on buildExecutor, the resource budget for this build: caller-runs
+        // (single-threaded on the flush-writer thread) for a memtable flush, or the bounded compaction pool
+        // for a rebuild. This is intentionally NOT serialized on a node-wide lock, so concurrent memtable
+        // flushes scale with memtable_flush_writers the same way core sstable flushing does, and flush no
+        // longer contends with compaction's PQ work. Nothing here mutates shared state: getPqIfPresent reads
+        // a reference-counted view and the vectors are instance-local.
+        // build encoder (expensive for PQ)
+        if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
         {
-            // build encoder (expensive for PQ)
-            if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
-            {
-                var pqi = getPqIfPresent(indexContext, preferredCompression::equals);
-                compressor = computeOrRefineFrom(pqi, preferredCompression);
-            }
-            assert !vectorValues.isValueShared();
-            // encode (compress) the vectors to save
-            if (compressor != null && !writeFusedPQ)
-                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), buildExecutor);
+            var pqi = getPqIfPresent(indexContext, preferredCompression::equals);
+            compressor = computeOrRefineFrom(pqi, preferredCompression);
         }
+        assert !vectorValues.isValueShared();
+        // encode (compress) the vectors to save
+        if (compressor != null && !writeFusedPQ)
+            cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), buildExecutor);
 
         var actualType = compressor == null ? CompressionType.NONE : preferredCompression.type;
         writePqHeader(writer, allVectorsAreUnitLength, actualType, indexContext.version());
