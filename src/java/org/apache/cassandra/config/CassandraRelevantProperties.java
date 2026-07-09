@@ -494,6 +494,15 @@ public enum CassandraRelevantProperties
     // unbounded executor queue. Capped at ~2 GiB (int permit space). Set to 0 to disable the bound
     // entirely (unbounded fan-out in both task count and memory).
     SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB("cassandra.sai.vector.compaction_insert_inflight_mb", "128"),
+    // Encode PQ codes incrementally during ingest (against a codebook the memtable adopts from an existing
+    // on-disk segment) so a memtable flush serializes pre-computed codes instead of encoding every vector
+    // in one flush-time burst. Falls back to flush-time encoding when no codebook is available yet
+    // (cold start). Read when a memtable vector graph is created (effective for the next new memtable).
+    SAI_VECTOR_AMORTIZE_PQ_ENCODING("cassandra.sai.vector.amortize_pq_encoding", "true"),
+    // Re-acquire the process-wide lock around any residual flush-time PQ compute/encode (the cold-start or
+    // non-amortized fallback), serializing that work across all vector flushes/rebuilds node-wide as the
+    // pre-removal code did. Off by default (flushes parallelize like core sstable flushing). Read at flush.
+    SAI_VECTOR_SERIALIZE_FLUSH_PQ("cassandra.sai.vector.serialize_flush_pq", "false"),
 
     /**
      * Whether to disable auto-compaction

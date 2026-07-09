@@ -222,6 +222,48 @@ public class JVectorVersionUtil
         mergeBytesPerOrdinal = Math.max(1, bytes);
     }
 
+    /**
+     * Whether a memtable vector graph encodes PQ codes incrementally during ingest (adopting an existing
+     * on-disk codebook) so its flush serializes pre-built codes instead of encoding every vector in one
+     * flush-time burst. Read when a memtable graph is created, so a change is effective for the next new
+     * memtable. See {@link CassandraRelevantProperties#SAI_VECTOR_AMORTIZE_PQ_ENCODING}.
+     */
+    private static volatile boolean amortizePqEncoding =
+        CassandraRelevantProperties.SAI_VECTOR_AMORTIZE_PQ_ENCODING.getBoolean();
+
+    /** Whether memtable flushes encode PQ incrementally during ingest (vs. one flush-time burst). */
+    public static boolean isAmortizePqEncoding()
+    {
+        return amortizePqEncoding;
+    }
+
+    /** Enable/disable incremental PQ encoding during ingest; takes effect for the next new memtable. */
+    public static void setAmortizePqEncoding(boolean enabled)
+    {
+        amortizePqEncoding = enabled;
+    }
+
+    /**
+     * Whether any residual flush-time PQ compute/encode (the cold-start or non-amortized fallback) is
+     * serialized node-wide on a process-wide lock, restoring the pre-removal behavior. Off by default, so
+     * concurrent flushes parallelize like core sstable flushing. Read at flush (effective next flush).
+     * See {@link CassandraRelevantProperties#SAI_VECTOR_SERIALIZE_FLUSH_PQ}.
+     */
+    private static volatile boolean serializeFlushPq =
+        CassandraRelevantProperties.SAI_VECTOR_SERIALIZE_FLUSH_PQ.getBoolean();
+
+    /** Whether residual flush-time PQ work is serialized node-wide (default false). */
+    public static boolean isSerializeFlushPq()
+    {
+        return serializeFlushPq;
+    }
+
+    /** Enable/disable node-wide serialization of residual flush-time PQ work; takes effect next flush. */
+    public static void setSerializeFlushPq(boolean enabled)
+    {
+        serializeFlushPq = enabled;
+    }
+
     /** Whether vector-index compaction merges existing on-disk graphs (vs. the legacy rebuild path). */
     public static boolean isGraphCompactionMergeEnabled()
     {
@@ -337,5 +379,10 @@ public class JVectorVersionUtil
                         ? (getInsertInflightMb() + " MiB in-flight budget (bounded)")
                         : "unbounded (in-flight budget disabled)",
                     CassandraRelevantProperties.SAI_VECTOR_COMPACTION_INSERT_INFLIGHT_MB.getKey());
+        logger.info("JVector memtable flush PQ: amortized encoding {} (-D{}), residual flush-time PQ {} (-D{})",
+                    amortizePqEncoding ? "on (encode during ingest)" : "off (encode at flush)",
+                    CassandraRelevantProperties.SAI_VECTOR_AMORTIZE_PQ_ENCODING.getKey(),
+                    serializeFlushPq ? "serialized node-wide" : "parallel",
+                    CassandraRelevantProperties.SAI_VECTOR_SERIALIZE_FLUSH_PQ.getKey());
     }
 }

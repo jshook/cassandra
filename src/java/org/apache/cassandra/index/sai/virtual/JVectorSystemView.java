@@ -53,6 +53,8 @@ public class JVectorSystemView extends AbstractMutableVirtualTable
     private static final String P_BYTES_PER_ORDINAL = "compaction_merge_bytes_per_ordinal";
     private static final String P_BUILD_THREADS = "compaction_build_threads";
     private static final String P_INSERT_INFLIGHT_MB = "compaction_insert_inflight_mb";
+    private static final String P_AMORTIZE_PQ = "amortize_pq_encoding";
+    private static final String P_SERIALIZE_FLUSH_PQ = "serialize_flush_pq";
 
     public JVectorSystemView(String keyspace)
     {
@@ -75,6 +77,8 @@ public class JVectorSystemView extends AbstractMutableVirtualTable
         addRow(result, P_BYTES_PER_ORDINAL, Integer.toString(JVectorVersionUtil.getMergeBytesPerOrdinal()), "next merge");
         addRow(result, P_BUILD_THREADS, Integer.toString(JVectorVersionUtil.getDesiredCompactionBuildThreads()), "next compaction (lazy pool rebuild)");
         addRow(result, P_INSERT_INFLIGHT_MB, Integer.toString(JVectorVersionUtil.getInsertInflightMb()), "next segment build");
+        addRow(result, P_AMORTIZE_PQ, Boolean.toString(JVectorVersionUtil.isAmortizePqEncoding()), "next memtable");
+        addRow(result, P_SERIALIZE_FLUSH_PQ, Boolean.toString(JVectorVersionUtil.isSerializeFlushPq()), "next flush");
         return result;
     }
 
@@ -117,6 +121,12 @@ public class JVectorSystemView extends AbstractMutableVirtualTable
                 break;
             case P_INSERT_INFLIGHT_MB:
                 JVectorVersionUtil.setInsertInflightMb(parseInt(name, value));
+                break;
+            case P_AMORTIZE_PQ:
+                JVectorVersionUtil.setAmortizePqEncoding(parseBool(name, value));
+                break;
+            case P_SERIALIZE_FLUSH_PQ:
+                JVectorVersionUtil.setSerializeFlushPq(parseBool(name, value));
                 break;
             default:
                 throw new InvalidRequestException(String.format(

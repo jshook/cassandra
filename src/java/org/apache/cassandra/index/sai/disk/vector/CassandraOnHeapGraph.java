@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.IntFunction;
 import java.util.function.IntUnaryOperator;
@@ -58,6 +59,7 @@ import io.github.jbellis.jvector.graph.disk.feature.NVQ;
 import io.github.jbellis.jvector.graph.similarity.BuildScoreProvider;
 import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
 import io.github.jbellis.jvector.quantization.CompressedVectors;
+import io.github.jbellis.jvector.quantization.MutablePQVectors;
 import io.github.jbellis.jvector.quantization.PQVectors;
 import io.github.jbellis.jvector.quantization.NVQuantization;
 import io.github.jbellis.jvector.quantization.ProductQuantization;
@@ -117,6 +119,15 @@ public class CassandraOnHeapGraph<T> implements Accountable
     /** minimum number of rows to perform PQ codebook generation */
     public static final int MIN_PQ_ROWS = 1024;
 
+    /** Short view-reference timeout for adopting a codebook on the memtable graph ctor (a write-path call). */
+    private static final long ADOPT_PQ_TIMEOUT_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+
+    /**
+     * Optional node-wide serialization of residual flush-time PQ compute/encode, engaged only when
+     * {@code serialize_flush_pq} is set (default off). The amortized path never touches it.
+     */
+    private static final ReentrantLock FLUSH_PQ_LOCK = new ReentrantLock();
+
     private static final Logger logger = LoggerFactory.getLogger(CassandraOnHeapGraph.class);
     private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
 
@@ -144,6 +155,15 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private final ThreadLocal<GraphSearcherAccessManager> searchers;
 
     private final boolean writeNvq;
+
+    /**
+     * Amortized PQ: when the memtable graph adopts an existing codebook at construction, each vector is
+     * encoded on insert into {@link #incrementalPqVectors} (build-ordinal indexed), so the flush serializes
+     * pre-built codes instead of encoding the whole memtable. Both are null when not amortizing (cold start,
+     * non-PQ compression, or the feature is off), and the flush falls back to encoding at flush time.
+     */
+    private final ProductQuantization incrementalPqEncoder;
+    private final MutablePQVectors incrementalPqVectors;
 
     /**
      * @param forSearching if true, vectorsByKey will be initialized and populated with vectors as they are added
@@ -206,6 +226,24 @@ public class CassandraOnHeapGraph<T> implements Accountable
                                         buildExecutor,
                                         buildExecutor);
         searchers = ThreadLocal.withInitial(() -> new GraphSearcherAccessManager(new GraphSearcher(builder.getGraph())));
+
+        // Amortized PQ: adopt an existing on-disk codebook (non-blocking) so each vector can be encoded on
+        // insert and the flush can skip the whole-memtable encode. Only the memtable graph (forSearching)
+        // amortizes; a cold start (no codebook yet) or non-PQ compression leaves these null and the flush
+        // encodes at flush time.
+        ProductQuantization adoptedPq = null;
+        if (forSearching && JVectorVersionUtil.isAmortizePqEncoding())
+        {
+            var preferredCompression = sourceModel.compressionProvider.apply(dimension);
+            if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
+            {
+                var pqi = getPqIfPresent(context, preferredCompression::equals, ADOPT_PQ_TIMEOUT_NANOS);
+                if (pqi != null)
+                    adoptedPq = pqi.pq;
+            }
+        }
+        incrementalPqEncoder = adoptedPq;
+        incrementalPqVectors = adoptedPq == null ? null : new MutablePQVectors(adoptedPq);
     }
 
     public int size()
@@ -304,6 +342,14 @@ public class CassandraOnHeapGraph<T> implements Accountable
                 var success = postingsByOrdinal.compareAndPut(ordinal, null, postings);
                 assert success : "postingsByOrdinal already contains an entry for ordinal " + ordinal;
                 bytesUsed += builder.addGraphNode(ordinal, vector);
+
+                // Amortized PQ: encode this vector now (build-ordinal indexed) so the flush serializes
+                // pre-built codes. MutablePQVectors is threadsafe and each insert has a unique ordinal.
+                if (incrementalPqVectors != null)
+                {
+                    incrementalPqVectors.encodeAndSet(ordinal, vector);
+                    bytesUsed += incrementalPqEncoder.compressedVectorSize();
+                }
 
                 // If necessary, check if the vector is unit length.
                 if (!sourceModel.hasKnownUnitLengthVectors() && allVectorsAreUnitLength)
@@ -578,14 +624,13 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
         if (compressor instanceof ProductQuantization && writeFusedPQ)
         {
-            // Encode the vectors for the fused-PQ feature on buildExecutor -- caller-runs (single-threaded on
-            // the flush-writer thread) for a memtable flush, or the bounded compaction pool for a rebuild.
-            // This is no longer serialized on a node-wide lock; concurrent flushes are bounded by
-            // memtable_flush_writers. https://github.com/riptano/cndb/issues/12110 tracks encoding the PQ
-            // iteratively during ingest so it need not be recomputed here at all.
-            // Note: the features implementation expects the pqVectors to be addressable on their old ordinal
-            // index, so we use the original vectorValues as the source without performing any remapping.
-            PQVectors pqVectors = (PQVectors) compressor.encodeAll(vectorValues, buildExecutor);
+            // The fused feature is addressed by old (build) ordinal, exactly how the graph writer invokes
+            // this supplier. When amortizing, the codes were already built during ingest (cndb#12110), so we
+            // use them directly and skip the flush-time encode; otherwise encode now on buildExecutor
+            // (caller-runs on the flush thread / bounded pool), optionally serialized node-wide.
+            PQVectors pqVectors = incrementalPqVectors != null
+                                  ? incrementalPqVectors
+                                  : encodeForFused(compressor);
             features.put(FeatureId.FUSED_PQ, nodeId -> new FusedPQ.State(view, pqVectors::get, nodeId));
         }
 
@@ -599,9 +644,19 @@ public class CassandraOnHeapGraph<T> implements Accountable
      */
     public static PqInfo getPqIfPresent(IndexContext indexContext, Function<VectorCompression, Boolean> matcher)
     {
+        return getPqIfPresent(indexContext, matcher, TimeUnit.SECONDS.toNanos(5));
+    }
+
+    /**
+     * As {@link #getPqIfPresent(IndexContext, Function)}, but with an explicit view-reference timeout. The
+     * memtable graph adopts a codebook on its constructor (a write-path call), so it passes a short timeout
+     * to avoid stalling the first write behind a view acquisition; a null result just disables amortization.
+     */
+    public static PqInfo getPqIfPresent(IndexContext indexContext, Function<VectorCompression, Boolean> matcher, long viewTimeoutNanos)
+    {
         // Retrieve the first compressed vectors for a segment with at least MAX_PQ_TRAINING_SET_SIZE rows
         // or the one with the most rows if none reach that size
-        var view = indexContext.getReferencedView(TimeUnit.SECONDS.toNanos(5));
+        var view = indexContext.getReferencedView(viewTimeoutNanos);
         if (view == null)
         {
             logger.warn("Unable to get view of already built indexes for {}", indexContext);
@@ -647,26 +702,51 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private VectorCompressor<?> writePQ(SequentialWriter writer, V5VectorPostingsWriter.RemappedPostings remapped, IndexContext indexContext, boolean writeFusedPQ) throws IOException
     {
         var preferredCompression = sourceModel.compressionProvider.apply(vectorValues.dimension());
+        int jvectorVersion = indexContext.version().onDiskFormat().jvectorFileFormatVersion();
 
-        // Build encoder and compress vectors
+        // Amortized path: PQ codes were encoded during ingest against an adopted codebook, so just serialize
+        // the pre-built codes -- no flush-time train/encode. Fused consumes incrementalPqVectors directly in
+        // suppliers() (build-ordinal indexed, exactly how the graph writer invokes the feature supplier);
+        // non-fused writes a row-id-ordered copy (a cheap per-vector byte reorder, not a re-encode).
+        if (incrementalPqVectors != null)
+        {
+            writePqHeader(writer, allVectorsAreUnitLength, preferredCompression.type, indexContext.version());
+            if (writeFusedPQ)
+            {
+                incrementalPqEncoder.write(writer, jvectorVersion);
+                return incrementalPqEncoder;
+            }
+            reorderCodesForFlush(remapped).write(writer, jvectorVersion);
+            return null;
+        }
+
+        // Fallback (cold start / feature off): adopt-or-train a codebook and encode the whole memtable now.
+        // buildExecutor is the resource budget (caller-runs on the flush thread / bounded compaction pool).
+        // Optionally serialized node-wide via serialize_flush_pq to cap concurrent flush-time PQ CPU (off by
+        // default, so flushes parallelize like core sstable flushing).
         VectorCompressor<?> compressor = null; // will be null if we can't compress
         CompressedVectors cv = null;
-        // PQ training and encoding run on buildExecutor, the resource budget for this build: caller-runs
-        // (single-threaded on the flush-writer thread) for a memtable flush, or the bounded compaction pool
-        // for a rebuild. This is intentionally NOT serialized on a node-wide lock, so concurrent memtable
-        // flushes scale with memtable_flush_writers the same way core sstable flushing does, and flush no
-        // longer contends with compaction's PQ work. Nothing here mutates shared state: getPqIfPresent reads
-        // a reference-counted view and the vectors are instance-local.
-        // build encoder (expensive for PQ)
-        if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
+        boolean serialize = JVectorVersionUtil.isSerializeFlushPq();
+        if (serialize)
+            FLUSH_PQ_LOCK.lock();
+        try
         {
-            var pqi = getPqIfPresent(indexContext, preferredCompression::equals);
-            compressor = computeOrRefineFrom(pqi, preferredCompression);
+            // build encoder (expensive for PQ)
+            if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
+            {
+                var pqi = getPqIfPresent(indexContext, preferredCompression::equals);
+                compressor = computeOrRefineFrom(pqi, preferredCompression);
+            }
+            assert !vectorValues.isValueShared();
+            // encode (compress) the vectors to save
+            if (compressor != null && !writeFusedPQ)
+                cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), buildExecutor);
         }
-        assert !vectorValues.isValueShared();
-        // encode (compress) the vectors to save
-        if (compressor != null && !writeFusedPQ)
-            cv = compressor.encodeAll(new RemappedVectorValues(remapped, remapped.maxNewOrdinal, vectorValues), buildExecutor);
+        finally
+        {
+            if (serialize)
+                FLUSH_PQ_LOCK.unlock();
+        }
 
         var actualType = compressor == null ? CompressionType.NONE : preferredCompression.type;
         writePqHeader(writer, allVectorsAreUnitLength, actualType, indexContext.version());
@@ -675,13 +755,52 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
         if (writeFusedPQ)
         {
-            compressor.write(writer, indexContext.version().onDiskFormat().jvectorFileFormatVersion());
+            compressor.write(writer, jvectorVersion);
             return compressor;
         }
-
-        // save (outside the synchronized block, this is io-bound not CPU)
-        cv.write(writer, indexContext.version().onDiskFormat().jvectorFileFormatVersion());
+        cv.write(writer, jvectorVersion);
         return null; // Don't need compressor in this case
+    }
+
+    /**
+     * Reorder the ingest-time PQ codes (build-ordinal indexed) into the flush's row-id ordinal order for the
+     * non-fused on-disk layout by copying each surviving code -- a per-vector memcpy, far cheaper than
+     * re-encoding. Produces {@code maxNewOrdinal + 1} entries with holes (omitted new ordinals) zeroed, so
+     * the output is byte-identical to {@code encodeAll(RemappedVectorValues)} (same codebook, same bytes).
+     */
+    private MutablePQVectors reorderCodesForFlush(V5VectorPostingsWriter.RemappedPostings remapped)
+    {
+        OrdinalMapper mapper = remapped.ordinalMapper;
+        int codeBytes = incrementalPqEncoder.compressedVectorSize();
+        var reordered = new MutablePQVectors(incrementalPqEncoder);
+        for (int newOrd = 0; newOrd <= remapped.maxNewOrdinal; newOrd++)
+        {
+            reordered.setZero(newOrd); // allocate + zero (matches encodeAll's null -> zeroed slot)
+            int oldOrd = mapper.newToOld(newOrd);
+            if (oldOrd != OrdinalMapper.OMITTED)
+                reordered.get(newOrd).copyFrom(incrementalPqVectors.get(oldOrd), 0, 0, codeBytes);
+        }
+        return reordered;
+    }
+
+    /**
+     * Encode all vectors for the non-amortized fused-PQ fallback, on buildExecutor. Optionally serialized
+     * node-wide via {@code serialize_flush_pq} (off by default) to cap concurrent flush-time PQ CPU.
+     */
+    private PQVectors encodeForFused(VectorCompressor<?> compressor)
+    {
+        boolean serialize = JVectorVersionUtil.isSerializeFlushPq();
+        if (serialize)
+            FLUSH_PQ_LOCK.lock();
+        try
+        {
+            return (PQVectors) compressor.encodeAll(vectorValues, buildExecutor);
+        }
+        finally
+        {
+            if (serialize)
+                FLUSH_PQ_LOCK.unlock();
+        }
     }
 
     static void writePqHeader(DataOutput writer, boolean unitVectors, CompressionType type, Version version)

@@ -41,4 +41,14 @@ public interface JVectorCompactionControlMBean
     int getInsertInflightMb();
 
     void setInsertInflightMb(int mb);
+
+    /** Whether memtable flushes encode PQ incrementally during ingest (effective for the next new memtable). */
+    boolean getAmortizePqEncoding();
+
+    void setAmortizePqEncoding(boolean enabled);
+
+    /** Whether residual flush-time PQ work is serialized node-wide (effective next flush). */
+    boolean getSerializeFlushPq();
+
+    void setSerializeFlushPq(boolean enabled);
 }

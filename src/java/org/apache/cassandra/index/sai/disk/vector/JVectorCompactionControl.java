@@ -88,4 +88,28 @@ public final class JVectorCompactionControl implements JVectorCompactionControlM
     {
         JVectorVersionUtil.setInsertInflightMb(mb);
     }
+
+    @Override
+    public boolean getAmortizePqEncoding()
+    {
+        return JVectorVersionUtil.isAmortizePqEncoding();
+    }
+
+    @Override
+    public void setAmortizePqEncoding(boolean enabled)
+    {
+        JVectorVersionUtil.setAmortizePqEncoding(enabled);
+    }
+
+    @Override
+    public boolean getSerializeFlushPq()
+    {
+        return JVectorVersionUtil.isSerializeFlushPq();
+    }
+
+    @Override
+    public void setSerializeFlushPq(boolean enabled)
+    {
+        JVectorVersionUtil.setSerializeFlushPq(enabled);
+    }
 }
