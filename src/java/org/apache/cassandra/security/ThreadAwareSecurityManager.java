@@ -83,10 +83,25 @@ public final class ThreadAwareSecurityManager extends SecurityManager
 
     private static volatile boolean installed;
 
+    // JEP 486 (JDK 24+) permanently disabled the SecurityManager and java.security.Policy: both
+    // System.setSecurityManager and Policy.setPolicy throw UnsupportedOperationException. On those JDKs we
+    // skip the UDF SecurityManager sandbox rather than fail startup -- upstream Cassandra likewise moved
+    // away from the SecurityManager-based sandbox.
+    private static final boolean SECURITY_MANAGER_SUPPORTED = Runtime.version().feature() < 24;
+
     public static void install()
     {
         if (installed)
             return;
+
+        if (!SECURITY_MANAGER_SUPPORTED)
+        {
+            logger.warn("SecurityManager is unavailable on JDK {} (JEP 486); the UDF SecurityManager " +
+                        "sandbox is disabled. Do not run untrusted user-defined functions on this JDK.",
+                        Runtime.version().feature());
+            installed = true;
+            return;
+        }
 
         // this line is needed - we need to make sure AccessControlException is loaded before we install this SM
         // otherwise we may get into stackoverflow when javax.security is not allowed package, and ACE is tried to be
@@ -113,7 +128,8 @@ public final class ThreadAwareSecurityManager extends SecurityManager
         // A ProtectionDomain can have its origin at an oridinary code-source or provided via a
         // AccessController.doPrivileded() call.
         //
-        Policy.setPolicy(new Policy()
+        if (SECURITY_MANAGER_SUPPORTED)
+            Policy.setPolicy(new Policy()
         {
             public PermissionCollection getPermissions(CodeSource codesource)
             {
