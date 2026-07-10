@@ -33,7 +33,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableContext;
@@ -218,8 +218,13 @@ public class V1OnDiskFormat implements OnDiskFormat
             logger.debug(index.getIndexContext().logMessage("Starting a compaction index build. Global segment memory usage: {}"),
                          prettyPrintMemory(limiter.currentBytesUsed()));
 
-            Set<SSTableReader> inputSSTables = opType == OperationType.COMPACTION && tracker instanceof LifecycleTransaction
-                                               ? ((LifecycleTransaction) tracker).originals()
+            // Recover the compaction's input sstables to feed the streaming graph MERGE. Test against the
+            // ILifecycleTransaction interface, not the concrete LifecycleTransaction: a sharded/wrapped
+            // compaction carries a PartialLifecycleTransaction / WrappedLifecycleTransaction (both delegate
+            // originals() to the underlying transaction), which would otherwise fail this check and force a
+            // full graph rebuild (OFF_HEAP_REBUILD with inputs=0) instead of the cheap merge.
+            Set<SSTableReader> inputSSTables = opType == OperationType.COMPACTION && tracker instanceof ILifecycleTransaction
+                                               ? ((ILifecycleTransaction) tracker).originals()
                                                : null;
             return new SSTableIndexWriter(perIndexComponents, limiter, index.isDropped(), index.isUnloaded(), keyCount, inputSSTables);
         }
