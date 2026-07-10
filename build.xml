@@ -45,7 +45,7 @@
     -->
     <property name="java.default" value="11" />
     <!-- Not sure whether we need 17 below, at least jvm options were added some time ago for 17 -->
-    <property name="java.supported" value="11,17,22" />
+    <property name="java.supported" value="11,17,22,25" />
 
     <!-- directory details -->
     <property name="basedir" value="."/>
@@ -332,6 +332,19 @@
         <equals arg1="${ant.java.version}" arg2="22"/>
     </condition>
 
+    <!-- JDK 25: reuse the modern (jdk22) G1 + add-opens/add-exports set, plus finalize native access for
+         jvector-native (off-heap MemorySegment SIMD) and allow the sun.misc.Unsafe memory-access methods
+         Cassandra/jamm still use (deprecated-for-removal, warns otherwise). -->
+    <resources id="_jvm25_arg_items">
+        <resources refid="_jvm22_arg_items"/>
+        <string>--enable-native-access=ALL-UNNAMED</string>
+        <string>--sun-misc-unsafe-memory-access=allow</string>
+    </resources>
+    <pathconvert property="_jvm25_args_concat" refid="_jvm25_arg_items" pathsep=" "/>
+    <condition property="java-jvmargs" value="${_jvm25_args_concat}">
+        <equals arg1="${ant.java.version}" arg2="25"/>
+    </condition>
+
     <!--
       JVM arguments for tests.
 
@@ -370,6 +383,15 @@
     </condition>
     <condition property="_std-test-jvmargs" value="${_jvm22_test_arg_items_concat}">
         <equals arg1="${ant.java.version}" arg2="22"/>
+    </condition>
+    <resources id="_jvm25_test_arg_items">
+        <string>-Dio.netty.tryReflectionSetAccessible=true</string>
+        <!-- Enable vector incubator feature (simd support) -->
+        <string>--add-modules jdk.incubator.vector</string>
+    </resources>
+    <pathconvert property="_jvm25_test_arg_items_concat" refid="_jvm25_test_arg_items" pathsep=" "/>
+    <condition property="_std-test-jvmargs" value="${_jvm25_test_arg_items_concat}">
+        <equals arg1="${ant.java.version}" arg2="25"/>
     </condition>
 
     <!-- needed to compile org.apache.cassandra.utils.JMXServerUtils -->
