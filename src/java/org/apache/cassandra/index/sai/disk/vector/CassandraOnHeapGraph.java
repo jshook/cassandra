@@ -68,7 +68,6 @@ import io.github.jbellis.jvector.util.Accountable;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.DenseIntMap;
 import io.github.jbellis.jvector.util.RamUsageEstimator;
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorUtil;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -185,8 +184,18 @@ public class CassandraOnHeapGraph<T> implements Accountable
         // that identifies vectors that are equal but not the same reference.  A comparison-
         // based Map (which only needs to look at vector elements until a difference is found)
         // is thus a better option than hash-based (which has to look at all elements to compute the hash).
+        // Compare element-by-element through the VectorFloat interface: this works for both the on-heap
+        // (ArrayVectorFloat) and native (MemorySegmentVectorFloat) providers, stops at the first differing
+        // element, and allocates nothing -- unlike toArray()/Arrays.compare, which copies both vectors.
         postingsMap = new ConcurrentSkipListMap<>((a, b) -> {
-            return Arrays.compare(((ArrayVectorFloat) a).get(), ((ArrayVectorFloat) b).get());
+            int len = Math.min(a.length(), b.length());
+            for (int i = 0; i < len; i++)
+            {
+                int cmp = Float.compare(a.get(i), b.get(i));
+                if (cmp != 0)
+                    return cmp;
+            }
+            return Integer.compare(a.length(), b.length());
         });
         postingsByOrdinal = new DenseIntMap<>(1024);
         deletedOrdinals = new IntHashSet();

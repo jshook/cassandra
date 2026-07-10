@@ -34,7 +34,6 @@ import org.junit.Test;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.SparseBits;
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
@@ -394,7 +393,14 @@ public class V5OnDiskOrdinalsMapTest extends VectorTester
     private static <T> ConcurrentSkipListMap<VectorFloat<?>, VectorPostings<T>> emptyPostingsMap()
     {
         return new ConcurrentSkipListMap<>((a, b) -> {
-            return Arrays.compare(((ArrayVectorFloat) a).get(), ((ArrayVectorFloat) b).get());
+            int len = Math.min(a.length(), b.length());
+            for (int i = 0; i < len; i++)
+            {
+                int cmp = Float.compare(a.get(i), b.get(i));
+                if (cmp != 0)
+                    return cmp;
+            }
+            return Integer.compare(a.length(), b.length());
         });
     }
 

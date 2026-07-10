@@ -27,7 +27,6 @@ import com.google.common.annotations.VisibleForTesting;
 
 import io.github.jbellis.jvector.util.DenseIntMap;
 import io.github.jbellis.jvector.util.RamUsageEstimator;
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
@@ -104,7 +103,12 @@ public class ConcurrentVectorValues implements RamAwareVectorValues
 
         for (var i = 0; i < size(); i++) {
             int ord = ordinalMapper.applyAsInt(i);
-            var fb = FloatBuffer.wrap(((ArrayVectorFloat) values.get(ord)).get());
+            // copy out through the VectorFloat interface so this works for both the on-heap and native providers
+            var vf = values.get(ord);
+            var arr = new float[vf.length()];
+            for (var j = 0; j < arr.length; j++)
+                arr[j] = vf.get(j);
+            var fb = FloatBuffer.wrap(arr);
             var bb = ByteBuffer.allocate(fb.capacity() * Float.BYTES);
             bb.asFloatBuffer().put(fb);
             writer.write(bb);

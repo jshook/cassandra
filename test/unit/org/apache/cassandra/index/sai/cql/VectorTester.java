@@ -33,7 +33,6 @@ import org.junit.runners.Parameterized;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.util.Bits;
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
@@ -103,7 +102,14 @@ public class VectorTester extends SAITester
 
         var nearestNeighbors = new ArrayList<float[]>();
         for (var ns : results.getNodes())
-            nearestNeighbors.add(((ArrayVectorFloat) vectorValues.getVector(ns.node)).get());
+        {
+            // copy out through the VectorFloat interface (works for on-heap and native providers)
+            var v = vectorValues.getVector(ns.node);
+            var arr = new float[v.length()];
+            for (var i = 0; i < arr.length; i++)
+                arr[i] = v.get(i);
+            nearestNeighbors.add(arr);
+        }
 
         return recallMatch(nearestNeighbors, result, topK);
     }

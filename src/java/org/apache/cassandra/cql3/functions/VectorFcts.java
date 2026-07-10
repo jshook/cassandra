@@ -21,7 +21,6 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Random;
 
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorUtil;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -202,8 +201,12 @@ public abstract class VectorFcts
                     // normalize
                     VectorUtil.l2normalize(vector);
 
-                    // serialize the normalized vector
-                    return vectorType.getSerializer().serializeFloatArray(((ArrayVectorFloat) vector).get());
+                    // serialize the normalized vector; copy it out through the VectorFloat interface so
+                    // this works for both the on-heap and native (off-heap MemorySegment) providers
+                    float[] normalized = new float[vector.length()];
+                    for (int i = 0; i < normalized.length; i++)
+                        normalized[i] = vector.get(i);
+                    return vectorType.getSerializer().serializeFloatArray(normalized);
                 }
             };
         }
