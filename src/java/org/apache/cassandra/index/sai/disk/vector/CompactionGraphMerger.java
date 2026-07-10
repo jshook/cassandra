@@ -43,6 +43,7 @@ import io.github.jbellis.jvector.util.work.ProgressLimiter;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import net.openhft.chronicle.map.ChronicleMap;
+import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.v1.SegmentMetadata;
@@ -94,11 +95,21 @@ public class CompactionGraphMerger
     {
         private final CassandraDiskAnn diskAnn;
         private final long segmentRowIdOffset;
+        // The SAI index owning this segment's on-disk graph, referenced for the merge's full duration so a
+        // concurrent DROP / index teardown cannot unmap the source files out from under the compactor's
+        // reads. Null only on the test path, where the caller manages source lifetime directly.
+        private final SSTableIndex sstableIndex;
 
         public SourceSegment(CassandraDiskAnn diskAnn, long segmentRowIdOffset)
         {
+            this(diskAnn, segmentRowIdOffset, null);
+        }
+
+        public SourceSegment(CassandraDiskAnn diskAnn, long segmentRowIdOffset, SSTableIndex sstableIndex)
+        {
             this.diskAnn = diskAnn;
             this.segmentRowIdOffset = segmentRowIdOffset;
+            this.sstableIndex = sstableIndex;
         }
 
         public CassandraDiskAnn diskAnn()
@@ -114,6 +125,11 @@ public class CompactionGraphMerger
         public OnDiskGraphIndex graph()
         {
             return diskAnn.getOnDiskGraph();
+        }
+
+        public SSTableIndex sstableIndex()
+        {
+            return sstableIndex;
         }
     }
 

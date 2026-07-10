@@ -477,11 +477,10 @@ public abstract class SegmentBuilder
                             java.util.Collections.emptyList(),
                             total);
 
-            // The merge runs on this compaction thread (jvector caller-runs executor), so the number
-            // of concurrent merges is already bounded by concurrent_compactors — no separate pool or
-            // gate is needed. Registering the operation makes the merge visible in nodetool
-            // compactionstats / system_views.sstable_tasks while it runs (it otherwise runs after the
-            // parent compaction already reads 100%).
+            // The merge's batch work runs on the shared, Cassandra-bounded jvector build pool, orchestrated
+            // from this compaction thread. Registering the operation makes it visible in nodetool
+            // compactionstats / system_views.sstable_tasks and, via CompactionProgressLimiter, lets a
+            // DROP/interrupt stop the merge cleanly (jvector drains its workers before compact() unwinds).
 
             // Charge the merge's estimated working set against the SAI segment-build memory limiter so
             // it participates in the same shared memory budget as ordinary segment builds; the merge
@@ -496,16 +495,40 @@ public abstract class SegmentBuilder
                 logger.warn("Vector graph merge estimated {} bytes pushes SAI segment-build memory to {} over the {} byte limit; proceeding",
                             memoryEstimate, memLimiter.currentBytesUsed(), memLimiter.limitBytes());
 
-            try (org.apache.cassandra.utils.NonThrowingCloseable c =
-                         org.apache.cassandra.db.compaction.CompactionManager.instance.active.onOperationStart(op))
+            // Pin every source SAI index for the merge's full lifetime. The compactor reads source vectors
+            // out of the sources' mmap'd files on pool workers; without a reference, a concurrent DROP / index
+            // teardown could release a source, unmap the file, and fault an in-flight read (use-after-unmap
+            // SIGSEGV). SSTableIndex.reference() defers the unmap until release(); jvector's compact() drains
+            // its workers before it returns or throws, so releasing after merge() (below) is always safe.
+            List<org.apache.cassandra.index.sai.SSTableIndex> pinnedSources = new ArrayList<>();
+            try
             {
-                var componentsMetadata = merger.merge(postingsMap, maxSegmentRowId,
-                        new org.apache.cassandra.index.sai.disk.vector.CompactionProgressLimiter(op));
-                op.setCompleted(total);
-                metadataBuilder.setComponentsMetadata(componentsMetadata);
+                for (var src : sourceSegments)
+                {
+                    org.apache.cassandra.index.sai.SSTableIndex idx = src.sstableIndex();
+                    if (idx == null)
+                        continue; // test path manages source lifetime directly
+                    if (!idx.reference())
+                        throw new IllegalStateException("Source SAI index is being released (DROP/teardown in progress); abandoning graph merge");
+                    pinnedSources.add(idx);
+                }
+
+                try (org.apache.cassandra.utils.NonThrowingCloseable c =
+                             org.apache.cassandra.db.compaction.CompactionManager.instance.active.onOperationStart(op))
+                {
+                    var componentsMetadata = merger.merge(postingsMap, maxSegmentRowId,
+                            new org.apache.cassandra.index.sai.disk.vector.CompactionProgressLimiter(op));
+                    op.setCompleted(total);
+                    metadataBuilder.setComponentsMetadata(componentsMetadata);
+                }
             }
             finally
             {
+                for (org.apache.cassandra.index.sai.SSTableIndex idx : pinnedSources)
+                {
+                    try { idx.release(); }
+                    catch (Throwable t) { logger.warn("Error releasing pinned source SAI index after graph merge", t); }
+                }
                 memLimiter.decrement(memoryEstimate);
                 logger.debug("Vector graph merge measurement: released {} bytes from SAI segment-build limiter ({} bytes used)",
                              memoryEstimate, memLimiter.currentBytesUsed());

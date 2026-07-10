@@ -40,9 +40,14 @@ import org.apache.cassandra.db.compaction.CompactionManager;
  *       internal write participates in that budget, not just the SAI-side copy.</li>
  * </ul>
  *
- * <p>Because the compactor runs with a caller-runs executor, jvector invokes both methods on the
- * compaction thread (no pool workers), so {@link #acquire} simply blocks that thread on the rate
- * limiter — exactly like ordinary compaction blocking on the same limiter.
+ * <p>jvector invokes both methods on the orchestrating (compaction) thread — the caller of
+ * {@code compact()} — while the merge's batch work runs on the shared build pool. So {@link #acquire}
+ * simply blocks that thread on the rate limiter, exactly like ordinary compaction blocking on the same
+ * limiter. Both methods also serve as the merge's <b>cancellation checkpoint</b>: they call
+ * {@link org.apache.cassandra.db.compaction.TableOperation#throwIfStopRequested()}, so a DROP or compaction
+ * interrupt stops the merge here. jvector drains its in-flight workers before {@code compact()} unwinds, so
+ * cancellation is clean — no source read survives — and it surfaces as the standard
+ * {@code CompactionInterruptedException}, which the compaction framework handles without error noise.
  */
 public class CompactionProgressLimiter implements ProgressLimiter
 {
@@ -59,12 +64,18 @@ public class CompactionProgressLimiter implements ProgressLimiter
     @Override
     public void onProgress(WorkStage stage, long completed, long total)
     {
+        // Cancellation checkpoint at each phase boundary: a stopped merge (DROP/interrupt) throws here and
+        // jvector drains its workers before compact() unwinds, so no source read survives the cancellation.
+        operation.throwIfStopRequested();
         operation.report(completed, total);
     }
 
     @Override
     public Grant acquire(long bytes)
     {
+        // Cancellation checkpoint: acquire is called frequently (per write batch), so a stopped merge
+        // unwinds promptly here rather than only at phase boundaries.
+        operation.throwIfStopRequested();
         // Disabled throttling (compaction_throughput_mb_per_sec == 0) sets the shared limiter's rate
         // to Double.MAX_VALUE; skip acquiring to avoid needless work, mirroring Cassandra's own
         // compactionRateLimiterAcquire guard. getRateLimiter() itself never returns null.

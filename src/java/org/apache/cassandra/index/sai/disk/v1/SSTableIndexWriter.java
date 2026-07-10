@@ -542,7 +542,7 @@ public class SSTableIndexWriter implements PerIndexWriter
                         continue;
                     }
                     inlineVectorSegments++;
-                    sources.add(new CompactionGraphMerger.SourceSegment(diskAnn, segment.metadata.segmentRowIdOffset));
+                    sources.add(new CompactionGraphMerger.SourceSegment(diskAnn, segment.metadata.segmentRowIdOffset, ssTableIndex));
                 }
             }
         }
