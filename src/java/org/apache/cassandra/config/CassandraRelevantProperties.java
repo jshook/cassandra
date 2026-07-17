@@ -454,9 +454,11 @@ public enum CassandraRelevantProperties
     // Whether compaction should build vector indexes using a fused graph, aka a graph where the quantized vectors
     // are stored inline with a graph node. Feature is still experimental, so defaults to false.
     SAI_VECTOR_ENABLE_FUSED("cassandra.sai.vector.enable_fused", "false"),
-    // Use nvq when building graphs in compaction. Disabled by default for now. Enabling will reduce recall slightly
-    // while also reducing the storage footprint.
-    SAI_VECTOR_ENABLE_NVQ("cassandra.sai.vector.enable_nvq", "false"),
+    // Use nvq when building graphs in compaction. Enabled by default: it reduces the storage footprint
+    // at a slight recall cost. Set `-Dcassandra.sai.vector.enable_nvq=false` to opt out.
+    // Note this only takes effect for index versions whose jvector file format is >= 4 (EC/V7 and
+    // later) — see JVectorVersionUtil.shouldWriteNVQ.
+    SAI_VECTOR_ENABLE_NVQ("cassandra.sai.vector.enable_nvq", "true"),
     // NVQ number of subvectors. This isn't really expected to change much so we're only exposing
     // it as a global variable in case it's needed.
     SAI_VECTOR_NVQ_NUM_SUB_VECTORS("cassandra.sai.vector.nvq_num_sub_vectors", "2"),

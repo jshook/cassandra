@@ -575,7 +575,11 @@ public class SSTableIndexWriter implements PerIndexWriter
                     scan == null ? 0 : scan.nonVectorSearchersSkipped,
                     indexContext.version(), V5OnDiskFormat.writeV5VectorPostings(indexContext.version()), heapProfile,
                     CompactionGraphMerger.ENABLED, JVectorVersionUtil.ENABLE_FUSED, JVectorVersionUtil.ENABLE_NVQ,
-                    V3OnDiskFormat.instance.jvectorFileFormatVersion());
+                    // The jvector format version ACTUALLY being written — read from the version
+                    // this build is emitting, not from V3's (which reports the
+                    // `cassandra.sai.jvector_version` property regardless of the output version,
+                    // e.g. logging 2 while an EC/V7 build writes 4).
+                    indexContext.version().onDiskFormat().jvectorFileFormatVersion());
     }
 
     /** Result of scanning a compaction's input sstables for jvector merge eligibility. */
