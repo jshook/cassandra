@@ -73,6 +73,14 @@ public class CompactionTask extends AbstractCompactionTask
 
     protected final int gcBefore;
     protected final boolean keepOriginals;
+    /**
+     * Set once this task's compaction operation has been registered with its
+     * {@link org.apache.cassandra.db.compaction.TableOperationObserver} (see
+     * {@code CompactionOperation}'s constructor). From that point the observer's closeable is
+     * guaranteed to be closed on teardown, so a parallelized subtask reads this in
+     * {@code cleanup} to decide whether it still owes its shared-operation slot a release.
+     */
+    protected volatile boolean operationStarted = false;
     /** for trace logging purposes only */
     private static final AtomicLong totalBytesCompacted = new AtomicLong();
 
@@ -432,6 +440,10 @@ public class CompactionTask extends AbstractCompactionTask
                 }
 
                 this.obsCloseable = opObserver.onOperationStart(op);
+                // From here the observer closeable WILL be closed on teardown (via close()),
+                // so any shared-operation slot is released by that path — cleanup() must not
+                // release it again.
+                CompactionTask.this.operationStarted = true;
                 for (var obs : getCompObservers())
                     obs.onInProgress(progress);
             }

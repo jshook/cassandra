@@ -136,6 +136,52 @@ public class SharedTableOperationTest {
     }
 
     @Test
+    public void testAbandonedSubtaskReleasesSlot() {
+        // Reproduces the truncate-mid-compaction leak: an expected subtask that never starts
+        // (its inputs were emptied by a concurrent truncate, so its task early-returns before
+        // onOperationStart) must still release its slot via abandonExpectedSubtask(), or
+        // toClose never reaches zero and the shared operation never deregisters — a zombie in
+        // system_views.sstable_tasks.
+        sharedTableOperation.registerExpectedSubtask();
+        sharedTableOperation.registerExpectedSubtask();
+        sharedTableOperation.registerExpectedSubtask();
+
+        TableOperationObserver wrappedObserver = sharedTableOperation.wrapObserver(mockObserver);
+
+        // Two subtasks start and finish normally.
+        NonThrowingCloseable c1 = wrappedObserver.onOperationStart(mockOperation1);
+        NonThrowingCloseable c2 = wrappedObserver.onOperationStart(mockOperation2);
+        c1.close();
+        c2.close();
+
+        // Registered once; NOT yet deregistered — the third slot is still outstanding.
+        verify(mockObserver, times(1)).onOperationStart(sharedTableOperation);
+        verify(mockCloseable, times(0)).close();
+
+        // The third subtask never starts and abandons its slot instead.
+        sharedTableOperation.abandonExpectedSubtask();
+
+        // Now the shared operation deregisters exactly once — no zombie left behind.
+        verify(mockCloseable, times(1)).close();
+    }
+
+    @Test
+    public void testAllSubtasksAbandonedIsACleanNoop() {
+        // If NO subtask ever starts, nothing was registered with the observer, so there is
+        // nothing to deregister and no zombie — abandoning every slot is a clean no-op.
+        sharedTableOperation.registerExpectedSubtask();
+        sharedTableOperation.registerExpectedSubtask();
+
+        sharedTableOperation.wrapObserver(mockObserver);
+
+        sharedTableOperation.abandonExpectedSubtask();
+        sharedTableOperation.abandonExpectedSubtask();
+
+        verify(mockObserver, times(0)).onOperationStart(sharedTableOperation);
+        verify(mockCloseable, times(0)).close();
+    }
+
+    @Test
     public void testThreeChildrenStop() {
         // Register expected subtasks
         sharedTableOperation.registerExpectedSubtask();

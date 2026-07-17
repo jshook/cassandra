@@ -50,6 +50,22 @@ public class SharedTableOperation extends AbstractTableOperation implements Tabl
         toClose.incrementAndGet();
     }
 
+    /// Release the slot of an expected subtask that terminated WITHOUT ever starting — i.e. one
+    /// that never obtained (and closed) the [#onOperationStart] closeable, so [#closeOne] will
+    /// never fire for it. This happens when a subtask's inputs are emptied by a concurrent
+    /// truncate/drop (its [CompactionTask] early-returns before creating the compaction
+    /// operation) or when it is rejected before execution.
+    ///
+    /// Symmetric with [#registerExpectedSubtask]: every expected subtask releases its slot
+    /// exactly once — via [#closeOne] if it started, or via this method if it did not. Without
+    /// it, `toClose` never reaches zero, so this shared operation never deregisters from
+    /// [ActiveOperations] and lingers forever as a phantom "active" compaction in
+    /// `system_views.sstable_tasks`.
+    public void abandonExpectedSubtask()
+    {
+        closeOne();
+    }
+
     @Override
     public Progress getProgress()
     {

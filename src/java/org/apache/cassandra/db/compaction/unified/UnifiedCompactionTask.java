@@ -105,6 +105,29 @@ public class UnifiedCompactionTask extends CompactionTask
                                                        : txn.originals();
     }
 
+    /**
+     * Guaranteed terminal for every subtask (called from {@code execute()}'s finally block and
+     * from {@code rejected()}). If this subtask terminated WITHOUT ever starting its compaction
+     * operation — its inputs were emptied by a concurrent truncate/drop so it early-returned
+     * before registering, or it was rejected before execution — it never released its
+     * {@link SharedTableOperation} slot via the normal {@code onOperationStart}/{@code closeOne}
+     * path. Release it here so the shared operation's refcount can reach zero and deregister
+     * from ActiveOperations; otherwise it lingers forever as a phantom "active" compaction in
+     * {@code system_views.sstable_tasks} — which in turn hangs any {@code await_empty} poller
+     * (e.g. an index-finalize step) waiting for that table's compactions to drain.
+     *
+     * A subtask that DID start released the slot in {@code close()}; {@code operationStarted}
+     * guards against the double release.
+     */
+    @Override
+    protected Throwable cleanup(Throwable err)
+    {
+        err = super.cleanup(err);
+        if (sharedOperation != null && !operationStarted)
+            err = org.apache.cassandra.utils.Throwables.perform(err, sharedOperation::abandonExpectedSubtask);
+        return err;
+    }
+
     @Override
     public CompactionAwareWriter getCompactionAwareWriter(CompactionRealm realm,
                                                           Directories directories,
